@@ -1,0 +1,44 @@
+# Builds WispCleaner.exe on every push and pull request; on a version tag (v1.0.0, ...) also
+# publishes a GitHub Release with the exe and its SHA-256 checksum attached.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (in-box .NET Framework compiler, no SDK needed)
+        shell: cmd
+        run: build.cmd
+
+      - name: Checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash bin\WispCleaner.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  WispCleaner.exe" | Out-File bin\WispCleaner.exe.sha256 -Encoding ascii
+          Get-Content bin\WispCleaner.exe.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WispCleaner
+          path: |
+            bin/WispCleaner.exe
+            bin/WispCleaner.exe.sha256
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME bin\WispCleaner.exe bin\WispCleaner.exe.sha256 --title "Wisp Cleaner $env:GITHUB_REF_NAME" --generate-notes
