@@ -41,16 +41,19 @@ namespace Wisp
             }
         }
 
+        /// <summary>The roots present on this PC; one lying inside another is dropped, so no file is counted twice.</summary>
         public IEnumerable<string> ExistingRoots()
         {
-            if (Roots == null) yield break;
+            if (Roots == null) return new string[0];
+            var found = new List<string>();
             foreach (string r in Roots())
             {
                 if (string.IsNullOrEmpty(r)) continue;
                 bool exists;
                 try { exists = Directory.Exists(r) || File.Exists(r); } catch { exists = false; }
-                if (exists) yield return r;
+                if (exists && !found.Any(f => FileOps.SamePath(f, r))) found.Add(r);
             }
+            return found.Where(r => !found.Any(o => !ReferenceEquals(o, r) && FileOps.IsUnder(r, o))).ToList();
         }
     }
 
@@ -65,8 +68,6 @@ namespace Wisp
     /// <summary>The list of everything the one-button clean knows about. Only targets present on this PC are listed.</summary>
     static class CleanCatalog
     {
-        static string Local { get { return Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData); } }
-        static string Roaming { get { return Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData); } }
         static string ProgData { get { return Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData); } }
         static string Win { get { return Environment.GetFolderPath(Environment.SpecialFolder.Windows); } }
 
@@ -79,9 +80,11 @@ namespace Wisp
             var sys = Group(groups, "sys", "Система", "System", "Временные файлы Windows и программ", "Temporary files of Windows and programs", "\uE7F8");
             Add(sys, new CleanItem
             {
-                Id = "sys.temp", Ru = "Временные файлы пользователя", En = "User temporary files",
-                NoteRu = "%TEMP%, старше суток", NoteEn = "%TEMP%, older than a day",
-                Roots = P(Path.Combine(Local, "Temp")), MinAgeHours = 24,
+                Id = "sys.temp", Ru = UserProfiles.Many ? "Временные файлы пользователей" : "Временные файлы пользователя",
+                En = UserProfiles.Many ? "Users' temporary files" : "User temporary files",
+                NoteRu = UserProfiles.Many ? "%TEMP% всех пользователей (" + UserProfiles.All.Count + "), старше суток" : "%TEMP%, старше суток",
+                NoteEn = UserProfiles.Many ? "%TEMP% of all users (" + UserProfiles.All.Count + "), older than a day" : "%TEMP%, older than a day",
+                Roots = UserTemp, MinAgeHours = 24,
             });
             Add(sys, new CleanItem
             {
@@ -93,13 +96,13 @@ namespace Wisp
             {
                 Id = "sys.inetcache", Ru = "Кэш интернета Windows", En = "Windows internet cache",
                 NoteRu = "INetCache", NoteEn = "INetCache",
-                Roots = P(Path.Combine(Local, @"Microsoft\Windows\INetCache")),
+                Roots = UserProfiles.Local(@"Microsoft\Windows\INetCache"),
             });
             Add(sys, new CleanItem
             {
                 Id = "sys.thumbs", Ru = "Кэш эскизов", En = "Thumbnail cache",
                 NoteRu = "Пересоздаётся проводником", NoteEn = "Rebuilt by Explorer",
-                Roots = P(Path.Combine(Local, @"Microsoft\Windows\Explorer")), Patterns = new[] { "thumbcache_*.db" }, Recursive = false,
+                Roots = UserProfiles.Local(@"Microsoft\Windows\Explorer"), Patterns = new[] { "thumbcache_*.db" }, Recursive = false,
             });
 
             var upd = Group(groups, "upd", "Обновления Windows", "Windows Update", "Уже установленные загрузки обновлений", "Downloads of already installed updates", "\uE895");
@@ -137,56 +140,56 @@ namespace Wisp
             }
 
             var apps = Group(groups, "app", "Приложения", "Apps", "Кэш мессенджеров, плееров и лаунчеров", "Cache of messengers, players and launchers", "\uE71D");
-            Add(apps, App("app.discord", "Discord", Roaming, @"discord\Cache", @"discord\Code Cache", @"discord\GPUCache"));
-            Add(apps, App("app.teams", "Microsoft Teams", Roaming, @"Microsoft\Teams\Cache", @"Microsoft\Teams\Code Cache", @"Microsoft\Teams\GPUCache",
-                @"Microsoft\Teams\Service Worker\CacheStorage", @"Microsoft\Teams\tmp"));
-            Add(apps, App("app.slack", "Slack", Roaming, @"Slack\Cache", @"Slack\Code Cache", @"Slack\GPUCache", @"Slack\Service Worker\CacheStorage"));
-            Add(apps, App("app.spotify", "Spotify", Local, @"Spotify\Storage", @"Spotify\Data"));
-            Add(apps, App("app.steam", "Steam", Local, @"Steam\htmlcache"));
-            Add(apps, App("app.vscode", "Visual Studio Code", Roaming, @"Code\Cache", @"Code\CachedData", @"Code\Code Cache", @"Code\GPUCache", @"Code\CachedExtensionVSIXs"));
-            Add(apps, App("app.zoom", "Zoom", Roaming, @"Zoom\data\Cache", @"Zoom\logs"));
-            Add(apps, App("app.epic", "Epic Games Launcher", Local, @"EpicGamesLauncher\Saved\webcache", @"EpicGamesLauncher\Saved\webcache_4147", @"EpicGamesLauncher\Saved\Logs"));
+            Add(apps, App("app.discord", "Discord", UserProfiles.Roaming(@"discord\Cache", @"discord\Code Cache", @"discord\GPUCache")));
+            Add(apps, App("app.teams", "Microsoft Teams", UserProfiles.Roaming(@"Microsoft\Teams\Cache", @"Microsoft\Teams\Code Cache", @"Microsoft\Teams\GPUCache",
+                @"Microsoft\Teams\Service Worker\CacheStorage", @"Microsoft\Teams\tmp")));
+            Add(apps, App("app.slack", "Slack", UserProfiles.Roaming(@"Slack\Cache", @"Slack\Code Cache", @"Slack\GPUCache", @"Slack\Service Worker\CacheStorage")));
+            Add(apps, App("app.spotify", "Spotify", UserProfiles.Local(@"Spotify\Storage", @"Spotify\Data")));
+            Add(apps, App("app.steam", "Steam", UserProfiles.Local(@"Steam\htmlcache")));
+            Add(apps, App("app.vscode", "Visual Studio Code", UserProfiles.Roaming(@"Code\Cache", @"Code\CachedData", @"Code\Code Cache", @"Code\GPUCache", @"Code\CachedExtensionVSIXs")));
+            Add(apps, App("app.zoom", "Zoom", UserProfiles.Roaming(@"Zoom\data\Cache", @"Zoom\logs")));
+            Add(apps, App("app.epic", "Epic Games Launcher", UserProfiles.Local(@"EpicGamesLauncher\Saved\webcache", @"EpicGamesLauncher\Saved\webcache_4147", @"EpicGamesLauncher\Saved\Logs")));
 
             var dev = Group(groups, "dev", "Кэш разработчика", "Developer caches", "Пакеты скачаются заново при следующей сборке", "Packages are downloaded again on the next build", "\uE943");
-            Add(dev, Dev("dev.npm", "npm", Path.Combine(Local, "npm-cache")));
-            Add(dev, Dev("dev.yarn", "Yarn", Path.Combine(Local, @"Yarn\Cache")));
-            Add(dev, Dev("dev.pip", "pip", Path.Combine(Local, @"pip\cache")));
-            Add(dev, Dev("dev.nuget", "NuGet (HTTP)", Path.Combine(Local, @"NuGet\v3-cache"), Path.Combine(Local, @"NuGet\http-cache")));
-            Add(dev, Dev("dev.gradle", "Gradle", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), @".gradle\caches")));
+            Add(dev, Dev("dev.npm", "npm", UserProfiles.Local("npm-cache")));
+            Add(dev, Dev("dev.yarn", "Yarn", UserProfiles.Local(@"Yarn\Cache")));
+            Add(dev, Dev("dev.pip", "pip", UserProfiles.Local(@"pip\cache")));
+            Add(dev, Dev("dev.nuget", "NuGet (HTTP)", UserProfiles.Local(@"NuGet\v3-cache", @"NuGet\http-cache")));
+            Add(dev, Dev("dev.gradle", "Gradle", UserProfiles.Home(@".gradle\caches")));
 
             var gpu = Group(groups, "gpu", "Шейдеры и драйверы", "Shaders and drivers", "Пересоздаются, первые запуски игр могут быть медленнее", "Rebuilt; the first game launches may be slower", "\uE7F4");
             Add(gpu, new CleanItem
             {
                 Id = "gpu.d3d", Ru = "Кэш шейдеров DirectX", En = "DirectX shader cache", DefaultOn = false,
-                Roots = P(Path.Combine(Local, "D3DSCache")),
+                Roots = UserProfiles.Local("D3DSCache"),
             });
             Add(gpu, new CleanItem
             {
                 Id = "gpu.nvidia", Ru = "Кэш шейдеров NVIDIA", En = "NVIDIA shader cache", DefaultOn = false,
-                Roots = P(Path.Combine(Local, @"NVIDIA\DXCache"), Path.Combine(Local, @"NVIDIA\GLCache"), Path.Combine(ProgData, @"NVIDIA Corporation\NV_Cache")),
+                Roots = Both(UserProfiles.Local(@"NVIDIA\DXCache", @"NVIDIA\GLCache"), Path.Combine(ProgData, @"NVIDIA Corporation\NV_Cache")),
             });
             Add(gpu, new CleanItem
             {
                 Id = "gpu.amd", Ru = "Кэш шейдеров AMD", En = "AMD shader cache", DefaultOn = false,
-                Roots = P(Path.Combine(Local, @"AMD\DxCache"), Path.Combine(Local, @"AMD\DxcCache"), Path.Combine(Local, @"AMD\GLCache"), Path.Combine(Local, @"AMD\VkCache")),
+                Roots = UserProfiles.Local(@"AMD\DxCache", @"AMD\DxcCache", @"AMD\GLCache", @"AMD\VkCache"),
             });
             Add(gpu, new CleanItem
             {
                 Id = "gpu.intel", Ru = "Кэш шейдеров Intel", En = "Intel shader cache", DefaultOn = false,
-                Roots = P(Path.Combine(Local, @"Intel\ShaderCache")),
+                Roots = UserProfiles.Local(@"Intel\ShaderCache"),
             });
 
             var logs = Group(groups, "log", "Логи и дампы", "Logs and dumps", "Отчёты об ошибках и аварийные дампы памяти", "Error reports and crash memory dumps", "\uE9F9");
             Add(logs, new CleanItem
             {
                 Id = "log.wer", Ru = "Отчёты об ошибках Windows", En = "Windows error reports",
-                Roots = P(Path.Combine(ProgData, @"Microsoft\Windows\WER\ReportArchive"), Path.Combine(ProgData, @"Microsoft\Windows\WER\ReportQueue"),
-                          Path.Combine(ProgData, @"Microsoft\Windows\WER\Temp"), Path.Combine(Local, @"Microsoft\Windows\WER")),
+                Roots = Both(UserProfiles.Local(@"Microsoft\Windows\WER"), Path.Combine(ProgData, @"Microsoft\Windows\WER\ReportArchive"),
+                          Path.Combine(ProgData, @"Microsoft\Windows\WER\ReportQueue"), Path.Combine(ProgData, @"Microsoft\Windows\WER\Temp")),
             });
             Add(logs, new CleanItem
             {
                 Id = "log.crashdumps", Ru = "Дампы сбоев программ", En = "App crash dumps",
-                Roots = P(Path.Combine(Local, "CrashDumps")),
+                Roots = UserProfiles.Local("CrashDumps"),
             });
             Add(logs, new CleanItem
             {
@@ -218,18 +221,31 @@ namespace Wisp
             if (item.Special != Special.None || item.ExistingRoots().Any()) g.Items.Add(item);
         }
 
-        static CleanItem App(string id, string name, string baseDir, params string[] rel)
+        static CleanItem App(string id, string name, Func<IEnumerable<string>> roots)
         {
-            return new CleanItem
-            {
-                Id = id, Ru = "Кэш " + name, En = name + " cache",
-                Roots = P(rel.Select(r => Path.Combine(baseDir, r)).ToArray()),
-            };
+            return new CleanItem { Id = id, Ru = "Кэш " + name, En = name + " cache", Roots = roots };
         }
 
-        static CleanItem Dev(string id, string name, params string[] roots)
+        static CleanItem Dev(string id, string name, Func<IEnumerable<string>> roots)
         {
-            return new CleanItem { Id = id, Ru = "Кэш " + name, En = name + " cache", DefaultOn = false, Roots = P(roots) };
+            return new CleanItem { Id = id, Ru = "Кэш " + name, En = name + " cache", DefaultOn = false, Roots = roots };
+        }
+
+        static Func<IEnumerable<string>> Both(Func<IEnumerable<string>> perUser, params string[] shared)
+        {
+            return () => perUser().Concat(shared);
+        }
+
+        /// <summary>
+        /// Temp of every profile. The app's own %TEMP% is added when it lies elsewhere (usually it is
+        /// AppData\Local\Temp or, on terminal servers, a per-session folder inside it).
+        /// </summary>
+        static IEnumerable<string> UserTemp()
+        {
+            var roots = UserProfiles.Local("Temp")().ToList();
+            string own = Path.GetTempPath();
+            if (!roots.Any(r => FileOps.IsUnder(own, r))) roots.Add(own);
+            return roots;
         }
     }
 }

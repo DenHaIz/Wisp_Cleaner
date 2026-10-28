@@ -21,13 +21,16 @@ namespace Wisp
         public const float DustSpan = 360f - SolidSweep;
 
         static Icon appIcon;
+        /// <summary>Every size Windows asks for at 100-200 % scaling (title bar, taskbar, Explorer), so it never scales one up.</summary>
+        public static readonly int[] IconSizes = { 16, 20, 24, 28, 30, 32, 36, 40, 48, 56, 60, 64, 72, 80, 96, 128, 256 };
+        static Bitmap header;
 
         public static Icon AppIcon
         {
             get
             {
                 if (appIcon == null)
-                    appIcon = new Icon(new MemoryStream(BuildIco(new[] { 16, 20, 24, 32, 40, 48, 64, 256 })));
+                    appIcon = new Icon(new MemoryStream(BuildIco(IconSizes)));
                 return appIcon;
             }
         }
@@ -35,7 +38,31 @@ namespace Wisp
         static readonly Color TileTop = Color.FromArgb(0x33, 0x35, 0x3B);
         static readonly Color TileBottom = Color.FromArgb(0x27, 0x28, 0x2C);
 
+        /// <summary>
+        /// The tiled mark at a whole-pixel spot, from a supersampled picture (see <see cref="Render"/>):
+        /// smooth even at 32 px, where the ring is barely two pixels wide.
+        /// </summary>
+        public static void DrawSharp(Graphics g, int x, int y, int size)
+        {
+            if (header == null || header.Width != size)
+            {
+                if (header != null) header.Dispose();
+                header = Render(size);
+            }
+            var state = g.Save();
+            g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            g.PixelOffsetMode = PixelOffsetMode.Half;
+            g.DrawImage(header, new Rectangle(x, y, size, size), 0, 0, size, size, GraphicsUnit.Pixel);
+            g.Restore(state);
+        }
+
         public static void Draw(Graphics g, RectangleF r, bool tile)
+        {
+            Draw(g, r, tile, 0);
+        }
+
+        /// <summary>shown: the size it ends up on screen (drawn larger to be scaled down), for the line weights.</summary>
+        public static void Draw(Graphics g, RectangleF r, bool tile, float shown)
         {
             var state = g.Save();
             g.SmoothingMode = SmoothingMode.AntiAlias;
@@ -54,8 +81,9 @@ namespace Wisp
             g.ScaleTransform(size / 256f, size / 256f);
 
             // Small icons (tray, title bar) get heavier lines so the mark survives 16 px.
-            float ringW = size < 24 ? 24 : (size < 40 ? 17 : 10);
-            float broomW = size < 24 ? 32 : (size < 40 ? 25 : 18);
+            float look = shown > 0 ? shown : size;
+            float ringW = look < 24 ? 24 : (look < 40 ? 17 : 10);
+            float broomW = look < 24 ? 32 : (look < 40 ? 25 : 18);
 
             // Lighter's ring: open from about 8 o'clock back up to 12.
             using (var pen = new Pen(Violet, ringW) { StartCap = LineCap.Round, EndCap = LineCap.Round })
@@ -65,7 +93,7 @@ namespace Wisp
             g.TranslateTransform(128, 128);
             g.RotateTransform(40);
             // A touch smaller when small, so the thick broom keeps a gap to the ring.
-            float k = size < 40 ? 0.56f : 0.62f;
+            float k = look < 40 ? 0.56f : 0.62f;
             g.ScaleTransform(k, k);
             g.TranslateTransform(-128, -128);
             using (var pen = new Pen(Violet, broomW) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
@@ -163,15 +191,34 @@ namespace Wisp
             }
         }
 
+        /// <summary>
+        /// The tiled mark, size x size: drawn 4 times larger and scaled down with a high-quality filter,
+        /// so every edge pixel is a true coverage average (GDI+'s own anti-aliasing steps on thin curves).
+        /// </summary>
         public static Bitmap Render(int size)
         {
-            var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
-            using (var g = Graphics.FromImage(bmp))
+            int k = size >= 128 ? 2 : 4, big = size * k;
+            using (var hi = new Bitmap(big, big, PixelFormat.Format32bppPArgb))
             {
-                g.Clear(Color.Transparent);
-                Draw(g, new RectangleF(0, 0, size, size), true);
+                using (var g = Graphics.FromImage(hi))
+                {
+                    g.Clear(Color.Transparent);
+                    Draw(g, new RectangleF(0, 0, big, big), true, size);
+                }
+                var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
+                using (var g = Graphics.FromImage(bmp))
+                using (var wrap = new ImageAttributes())
+                {
+                    g.Clear(Color.Transparent);
+                    g.CompositingMode = CompositingMode.SourceCopy;
+                    g.CompositingQuality = CompositingQuality.HighQuality;
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    wrap.SetWrapMode(WrapMode.TileFlipXY);
+                    g.DrawImage(hi, new Rectangle(0, 0, size, size), 0, 0, big, big, GraphicsUnit.Pixel, wrap);
+                }
+                return bmp;
             }
-            return bmp;
         }
 
         /// <summary>Multi-size .ico: 32-bit DIB frames for small sizes, PNG for 256.</summary>

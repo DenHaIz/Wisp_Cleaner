@@ -37,7 +37,7 @@ namespace Wisp
         {
             ring.Click += (s, e) => { if (ring.Clickable) DoClean(); };
             btnClean = new FlatButton("", "\uE74D", ButtonKind.Primary);
-            btnClean.Height = S(42);
+            btnClean.SetBaseHeight(44);
             btnClean.Font = Theme.UiBold;
             btnClean.Click += (s, e) => { if (done) StartScan(); else DoClean(); };
             btnRescan = new FlatButton("", "\uE72C", ButtonKind.Ghost);
@@ -91,14 +91,14 @@ namespace Wisp
             // ring fills it (up to 600 px), the button grows a little with the ring.
             int pad = S(16);
             int leftW = Math.Max(S(320), Math.Min(S(640), (int)(Width * 0.38)));
-            btnClean.Height = Height > S(760) ? S(46) : S(42);
+            btnClean.SetBaseHeight(Height > S(760) ? 48 : 44);
             int below = S(16) + btnClean.Height + S(10) + S(24);
             int ringSize = Math.Max(S(160), Math.Min(S(600), Math.Min(leftW, Height - pad * 2 - below - S(20))));
             int blockH = ringSize + below;
             int top = Math.Max(pad, (Height - blockH) / 2);
             ring.SetBounds(pad + (leftW - ringSize) / 2, top, ringSize, ringSize);
-            btnClean.Width = CleanButtonWidth();
-            btnClean.Location = new Point(pad + (leftW - btnClean.Width) / 2, ring.Bottom + S(16));
+            btnClean.Top = ring.Bottom + S(16);
+            PlaceCleanButton(false);
             hint.SetBounds(pad, btnClean.Bottom + S(10), leftW, S(24));
 
             int x = pad + leftW + S(20);
@@ -108,6 +108,22 @@ namespace Wisp
             catCard.SetBounds(x, pad, w, Math.Max(S(120), autoCard.Top - S(12) - pad));
         }
 
+        readonly object cleanKey = new object();
+
+        /// <summary>Centres the clean button under the ring; a new caption changes its width smoothly (as in DriveUP).</summary>
+        void PlaceCleanButton(bool animate)
+        {
+            int w = CleanButtonWidth(), x = ring.Left + (ring.Width - w) / 2;
+            if (!animate || !Visible || (w == btnClean.Width && x == btnClean.Left))
+            {
+                Anim.Cancel(cleanKey);
+                btnClean.SetBounds(x, btnClean.Top, w, btnClean.Height);
+                return;
+            }
+            int w0 = btnClean.Width, x0 = btnClean.Left;
+            Anim.Run(cleanKey, 240, t => btnClean.SetBounds((int)Math.Round(Anim.Lerp(x0, x, t)), btnClean.Top, (int)Math.Round(Anim.Lerp(w0, w, t)), btnClean.Height));
+        }
+
         int CleanButtonWidth()
         {
             return Math.Max(Math.Max(S(220), (int)(ring.Width * 0.55f)), btnClean.PreferredWidth + S(24));
@@ -115,7 +131,7 @@ namespace Wisp
 
         void LayoutCatCard()
         {
-            btnRescan.Height = S(30);
+            btnRescan.SetBaseHeight(32);
             btnRescan.Location = new Point(catCard.Width - btnRescan.Width - S(12), (catCard.TitleHeight - btnRescan.Height) / 2);
             list.SetBounds(S(2), catCard.TitleHeight, catCard.Width - S(4), catCard.Height - catCard.TitleHeight - S(6));
         }
@@ -196,28 +212,27 @@ namespace Wisp
             long sel = SelectedBytes();
             if (cleaning)
             {
-                SetButton(btnClean, L.T("Очистка…", "Cleaning…"));
+                btnClean.Text = L.T("Очистка…", "Cleaning…");
             }
             else if (done)
             {
                 ring.Caption = lastResult != null && lastResult.Freed > 0 ? L.T("освобождено", "freed") : L.T("уже чисто", "already clean");
-                SetButton(btnClean, L.T("Проверить снова", "Check again"));
+                btnClean.Text = L.T("Проверить снова", "Check again");
                 btnClean.Glyph = "\uE72C";
             }
             else if (scanning)
             {
                 ring.Caption = L.T("анализ…", "scanning…");
-                SetButton(btnClean, L.T("Очистить", "Clean"));
+                btnClean.Text = L.T("Очистить", "Clean");
                 btnClean.Glyph = "\uE74D";
             }
             else
             {
                 ring.Caption = sel > 0 ? L.T("можно освободить", "can be freed") : L.T("мусора не найдено", "no junk found");
-                SetButton(btnClean, L.T("Очистить", "Clean"));
+                btnClean.Text = L.T("Очистить", "Clean");
                 btnClean.Glyph = "\uE74D";
             }
-            btnClean.Width = CleanButtonWidth();
-            btnClean.Left = ring.Left + (ring.Width - btnClean.Width) / 2;
+            PlaceCleanButton(true);
             btnClean.Enabled = !cleaning && !scanning && (done || sel > 0);
             btnRescan.Enabled = !cleaning && !scanning;
             ring.Clickable = !cleaning && !scanning && !done && sel > 0;

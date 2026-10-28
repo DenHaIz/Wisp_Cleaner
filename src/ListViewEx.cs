@@ -31,7 +31,7 @@ namespace Wisp
     {
         RowKind RowKind { get; }
         string IconPath { get; }
-        /// <summary>0 = none, 1 = on (green), 2 = off (gray), 3 = problem (red).</summary>
+        /// <summary>0 = none, 1 = ok (green), 2 = off (gray), 3 = problem (red), 4 = news (accent), 5 = attention (amber).</summary>
         int Dot { get; }
     }
 
@@ -547,10 +547,10 @@ namespace Wisp
             var r = e.Bounds;
             using (var b = new SolidBrush(p.Surface)) g.FillRectangle(b, r);
             bool sorted = SortEnabled && e.ColumnIndex == SortColumn;
-            TextRenderer.DrawText(g, e.Header.Text, Theme.UiBold,
-                new Rectangle(r.X + S(10), r.Y, r.Width - S(34), r.Height), sorted ? p.Text : p.TextDim, p.Surface, CellFlags);
+            TextDraw.DrawText(g, e.Header.Text, Theme.UiBold,
+                new Rectangle(r.X + S(12), r.Y, r.Width - S(36), r.Height), sorted ? p.Text : p.TextDim, p.Surface, CellFlags);
             if (sorted && Theme.HasGlyphs)
-                TextRenderer.DrawText(g, SortDesc ? "\uE70D" : "\uE70E", Theme.GlyphSmall,
+                TextDraw.DrawText(g, SortDesc ? "\uE70D" : "\uE70E", Theme.GlyphSmall,
                     new Rectangle(r.Right - S(24), r.Y, S(16), r.Height), p.Accent, p.Surface,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
             using (var pen = new Pen(p.Border))
@@ -769,7 +769,7 @@ namespace Wisp
             }
             if (column == DotColumn && info != null && info.Dot > 0)
             {
-                Color dc = info.Dot == 1 ? p.Success : (info.Dot == 2 ? p.TextDim : p.Danger);
+                Color dc = info.Dot == 1 ? p.Success : (info.Dot == 2 ? p.TextDim : (info.Dot == 4 ? p.Accent : (info.Dot == 5 ? p.Warning : p.Danger)));
                 int d = S(8);
                 g.SmoothingMode = SmoothingMode.AntiAlias;
                 using (var b = new SolidBrush(Anim.Blend(dc, bg, fd)))
@@ -929,7 +929,7 @@ namespace Wisp
                     Anim.Blend(p.Surface, p.TextDim, 0.6f), ink * 0.035f);
                 y += gh + S(12);
             }
-            TextRenderer.DrawText(g, EmptyText, Font, new Rectangle(S(24), y, ClientSize.Width - S(48), S(60)),
+            TextDraw.DrawText(g, EmptyText, Font, new Rectangle(S(24), y, ClientSize.Width - S(48), S(60)),
                 p.TextDim, p.Surface,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.Top | TextFormatFlags.NoPrefix | TextFormatFlags.WordBreak);
         }

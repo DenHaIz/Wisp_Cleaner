@@ -124,19 +124,19 @@ namespace Wisp
 
         void LayoutToolbar()
         {
-            int x = S(16), y = (toolbar.Height - S(32)) / 2;
+            int x = S(16), y = (toolbar.Height - S(Theme.ControlH)) / 2;
             foreach (Control c in new Control[] { mode, btnFolder, threshold, btnScan })
             {
                 if (c == threshold && mode.SelectedIndex != 0) continue;
                 c.Location = new Point(x, y);
                 x = c.Right + (c == mode ? S(16) : S(8));
             }
-            progressText.SetBounds(x + S(12), y, Math.Max(S(40), toolbar.Width - x - S(28)), S(32));
+            progressText.SetBounds(x + S(12), y, Math.Max(S(40), toolbar.Width - x - S(28)), S(Theme.ControlH));
         }
 
         void LayoutActions()
         {
-            int y = (actions.Height - S(32)) / 2, x = S(16);
+            int y = (actions.Height - S(Theme.ControlH)) / 2, x = S(16);
             foreach (var b in new[] { btnMarkCopies, btnClear, btnShow })
             {
                 if (b == btnMarkCopies && mode.SelectedIndex != 1) continue;

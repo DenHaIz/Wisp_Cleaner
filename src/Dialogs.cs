@@ -30,28 +30,31 @@ namespace Wisp
             KeyPreview = true;
             Opacity = 0;
 
-            int S16 = Theme.S(16), pad = Theme.S(24);
-            var icon = new Label
+            int S16 = Theme.S(16), pad = Theme.S(24), iconBox = Theme.S(40);
+            // A fixed box for the icon: an auto-sized glyph label grows with DPI and covered the first letters.
+            var icon = new SmoothLabel
             {
                 Text = Theme.HasGlyphs ? iconGlyph : "",
-                Font = new Font("Segoe MDL2 Assets", 20f),
+                Font = new Font("Segoe MDL2 Assets", 20f * Theme.Zoom),
                 ForeColor = iconColor,
                 BackColor = p.Bg,
-                AutoSize = true,
-                Location = new Point(pad, pad),
+                AutoSize = false,
+                Size = new Size(iconBox, iconBox),
+                TextAlign = ContentAlignment.MiddleCenter,
+                Location = new Point(pad, pad - Theme.S(4)),
             };
-            var msg = new Label
+            var msg = new SmoothLabel
             {
                 Text = message,
                 AutoSize = true,
-                MaximumSize = new Size(Theme.S(440), 0),
+                MaximumSize = new Size(Theme.S(460), 0),
                 ForeColor = p.Text,
                 BackColor = p.Bg,
-                Location = new Point(pad + Theme.S(48), pad + Theme.S(4)),
+                Location = new Point(pad + iconBox + S16, pad + Theme.S(4)),
                 UseMnemonic = false,
             };
-            Controls.Add(icon);
             Controls.Add(msg);
+            Controls.Add(icon);
 
             var footer = new Panel { BackColor = p.Surface, Height = Theme.S(64), Dock = DockStyle.Bottom };
             footer.Paint += (s, e) =>
@@ -73,8 +76,26 @@ namespace Wisp
                 footer.Controls.Add(cancel);
             }
 
-            int contentW = msg.Left + msg.PreferredSize.Width + pad;
-            int contentH = Math.Max(icon.Bottom, msg.Top + msg.PreferredSize.Height) + pad;
+            // A long message (a list of risky settings) scrolls inside the dialog instead of running off the screen.
+            Size text = msg.PreferredSize;
+            var screen = Screen.FromPoint(Control.MousePosition).WorkingArea;
+            int maxText = Math.Max(Theme.S(160), screen.Height - footer.Height - pad * 2 - Theme.S(96));
+            Control body = msg;
+            if (text.Height > maxText)
+            {
+                var host = new Panel { AutoScroll = true, BackColor = p.Bg, Location = msg.Location, Size = new Size(text.Width + SystemInformation.VerticalScrollBarWidth + Theme.S(8), maxText) };
+                host.HandleCreated += (s, e) => Native.SetWindowTheme(host.Handle, Theme.Current.IsDark ? "DarkMode_Explorer" : "Explorer", null);
+                Controls.Remove(msg);
+                msg.Location = Point.Empty;
+                host.Controls.Add(msg);
+                Controls.Add(host);
+                body = host;
+                text = host.Size;
+                Shown += (s, e) => host.Focus();
+                MouseWheel += (s, e) => host.AutoScrollPosition = new Point(0, -host.AutoScrollPosition.Y - e.Delta);
+            }
+            int contentW = body.Left + text.Width + pad;
+            int contentH = Math.Max(icon.Bottom, body.Top + text.Height) + pad;
             ClientSize = new Size(Math.Max(contentW, Theme.S(400)), contentH + footer.Height);
 
             int bx = ClientSize.Width - pad;
@@ -192,7 +213,7 @@ namespace Wisp
             if (tag != null && Theme.HasGlyphs)
             {
                 Color c = !e.Item.Enabled ? Anim.Blend(p.TextDim, p.SurfaceAlt, 0.5f) : (tag.Danger ? p.Danger : p.TextDim);
-                TextRenderer.DrawText(g, tag.Glyph, Theme.Glyph, new Rectangle(Theme.S(8), 0, Theme.S(20), r.Height), c,
+                TextDraw.DrawText(g, tag.Glyph, Theme.Glyph, new Rectangle(Theme.S(8), 0, Theme.S(20), r.Height), c,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
             }
         }

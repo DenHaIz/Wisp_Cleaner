@@ -14,7 +14,7 @@ namespace Wisp
         static int Main(string[] args)
         {
             string path = args.Length > 0 ? args[0] : "app.ico";
-            var sizes = new[] { 16, 20, 24, 32, 40, 48, 64, 256 };
+            var sizes = Logo.IconSizes;
             File.WriteAllBytes(path, Logo.BuildIco(sizes));
             Console.WriteLine("Icon written: " + Path.GetFullPath(path));
             if (args.Length > 2 && args[1] == "--png")

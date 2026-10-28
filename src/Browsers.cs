@@ -20,14 +20,33 @@ namespace Wisp
         public BrowserKind Kind;
         public string UserData;      // Chromium "User Data" / Firefox Roaming root
         public string LocalData;     // Opera and Firefox keep the cache under %LOCALAPPDATA%
+        public UserProfile User;     // whose browser data this is
         public readonly List<BrowserProfile> Profiles = new List<BrowserProfile>();
+
+        /// <summary>The browser's processes of this user only: other users' sessions are none of our business.</summary>
+        public List<Process> Processes()
+        {
+            var list = new List<Process>();
+            try
+            {
+                foreach (var p in System.Diagnostics.Process.GetProcessesByName(Process))
+                {
+                    string owner = Secure.OwnerSid(p.Id);
+                    if (owner != null && string.Equals(owner, User.Sid, StringComparison.OrdinalIgnoreCase)) list.Add(p);
+                    else p.Dispose();
+                }
+            }
+            catch { }
+            return list;
+        }
 
         public bool IsRunning
         {
             get
             {
-                try { return System.Diagnostics.Process.GetProcessesByName(Process).Length > 0; }
-                catch { return false; }
+                var procs = Processes();
+                foreach (var p in procs) p.Dispose();
+                return procs.Count > 0;
             }
         }
 
@@ -124,31 +143,37 @@ namespace Wisp
 
     static class Browsers
     {
-        static string Local { get { return Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData); } }
-        static string Roaming { get { return Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData); } }
-
-        /// <summary>Installed browsers that have at least one profile on disk.</summary>
+        /// <summary>
+        /// Installed browsers that have at least one profile on disk, for every user profile on the PC
+        /// (see UserProfiles). With several users, each browser's name carries its user's name.
+        /// </summary>
         public static List<BrowserInfo> Detect()
         {
             var list = new List<BrowserInfo>();
-            AddChromium(list, "chrome", "Google Chrome", "chrome", "chrome.exe", Path.Combine(Local, @"Google\Chrome\User Data"), null, "chrome://extensions/?id=");
-            AddChromium(list, "edge", "Microsoft Edge", "msedge", "msedge.exe", Path.Combine(Local, @"Microsoft\Edge\User Data"), null, "edge://extensions/?id=");
-            AddChromium(list, "yandex", L.T("Яндекс Браузер", "Yandex Browser"), "browser", "browser.exe", Path.Combine(Local, @"Yandex\YandexBrowser\User Data"), null, "browser://extensions/?id=");
-            AddChromium(list, "brave", "Brave", "brave", "brave.exe", Path.Combine(Local, @"BraveSoftware\Brave-Browser\User Data"), null, "brave://extensions/?id=");
-            AddChromium(list, "vivaldi", "Vivaldi", "vivaldi", "vivaldi.exe", Path.Combine(Local, @"Vivaldi\User Data"), null, "vivaldi://extensions/?id=");
-            AddChromium(list, "opera", "Opera", "opera", "opera.exe", Path.Combine(Roaming, @"Opera Software\Opera Stable"), Path.Combine(Local, @"Opera Software\Opera Stable"), "opera://extensions/?id=");
-            AddChromium(list, "operagx", "Opera GX", "opera", "opera.exe", Path.Combine(Roaming, @"Opera Software\Opera GX Stable"), Path.Combine(Local, @"Opera Software\Opera GX Stable"), "opera://extensions/?id=");
-            AddFirefox(list);
+            foreach (var u in UserProfiles.All)
+            {
+                string local = u.Local, roaming = u.Roaming;
+                AddChromium(list, u, "chrome", "Google Chrome", "chrome", "chrome.exe", Path.Combine(local, @"Google\Chrome\User Data"), null, "chrome://extensions/?id=");
+                AddChromium(list, u, "edge", "Microsoft Edge", "msedge", "msedge.exe", Path.Combine(local, @"Microsoft\Edge\User Data"), null, "edge://extensions/?id=");
+                AddChromium(list, u, "yandex", L.T("Яндекс Браузер", "Yandex Browser"), "browser", "browser.exe", Path.Combine(local, @"Yandex\YandexBrowser\User Data"), null, "browser://extensions/?id=");
+                AddChromium(list, u, "brave", "Brave", "brave", "brave.exe", Path.Combine(local, @"BraveSoftware\Brave-Browser\User Data"), null, "brave://extensions/?id=");
+                AddChromium(list, u, "vivaldi", "Vivaldi", "vivaldi", "vivaldi.exe", Path.Combine(local, @"Vivaldi\User Data"), null, "vivaldi://extensions/?id=");
+                AddChromium(list, u, "opera", "Opera", "opera", "opera.exe", Path.Combine(roaming, @"Opera Software\Opera Stable"), Path.Combine(local, @"Opera Software\Opera Stable"), "opera://extensions/?id=");
+                AddChromium(list, u, "operagx", "Opera GX", "opera", "opera.exe", Path.Combine(roaming, @"Opera Software\Opera GX Stable"), Path.Combine(local, @"Opera Software\Opera GX Stable"), "opera://extensions/?id=");
+                AddFirefox(list, u);
+            }
+            if (list.Select(b => b.User).Distinct().Count() > 1)
+                foreach (var b in list) b.Name += " (" + b.User.Name + ")";
             return list;
         }
 
-        static void AddChromium(List<BrowserInfo> list, string id, string name, string process, string exe, string userData, string local, string extUrl)
+        static void AddChromium(List<BrowserInfo> list, UserProfile user, string id, string name, string process, string exe, string userData, string local, string extUrl)
         {
             if (!Directory.Exists(userData)) return;
             var b = new BrowserInfo
             {
-                Id = id, Name = name, Process = process, ExeName = exe, Kind = BrowserKind.Chromium,
-                UserData = userData, LocalData = local, ExtensionsUrl = extUrl,
+                Id = UserId(id, user), Name = name, Process = process, ExeName = exe, Kind = BrowserKind.Chromium,
+                UserData = userData, LocalData = local, ExtensionsUrl = extUrl, User = user,
             };
             var names = ProfileNames(Path.Combine(userData, "Local State"));
             if (local != null)
@@ -195,15 +220,21 @@ namespace Wisp
             return map;
         }
 
-        static void AddFirefox(List<BrowserInfo> list)
+        /// <summary>Settings key of a browser: the plain id for the first user (as before), "id@user" for the others.</summary>
+        static string UserId(string id, UserProfile user)
         {
-            string root = Path.Combine(Roaming, @"Mozilla\Firefox");
+            return user == UserProfiles.All[0] ? id : id + "@" + user.Name;
+        }
+
+        static void AddFirefox(List<BrowserInfo> list, UserProfile user)
+        {
+            string root = Path.Combine(user.Roaming, @"Mozilla\Firefox");
             string ini = Path.Combine(root, "profiles.ini");
             if (!File.Exists(ini)) return;
             var b = new BrowserInfo
             {
-                Id = "firefox", Name = "Mozilla Firefox", Process = "firefox", ExeName = "firefox.exe",
-                Kind = BrowserKind.Firefox, UserData = root, LocalData = Path.Combine(Local, @"Mozilla\Firefox"), ExtensionsUrl = "about:addons",
+                Id = UserId("firefox", user), Name = "Mozilla Firefox", Process = "firefox", ExeName = "firefox.exe", User = user,
+                Kind = BrowserKind.Firefox, UserData = root, LocalData = Path.Combine(user.Local, @"Mozilla\Firefox"), ExtensionsUrl = "about:addons",
             };
             string name = null, path = null;
             bool relative = true, inProfile = false;
@@ -283,18 +314,17 @@ namespace Wisp
         /// <summary>Asks the browser to close its windows, then ends whatever is left.</summary>
         public static void Close(BrowserInfo b)
         {
-            Process[] procs;
-            try { procs = Process.GetProcessesByName(b.Process); }
-            catch { return; }
-            foreach (var p in procs)
+            foreach (var p in b.Processes())
             {
                 try { p.CloseMainWindow(); } catch { }
+                p.Dispose();
             }
             var sw = Stopwatch.StartNew();
             while (sw.ElapsedMilliseconds < 4000 && b.IsRunning) System.Threading.Thread.Sleep(150);
-            foreach (var p in Process.GetProcessesByName(b.Process))
+            foreach (var p in b.Processes())
             {
                 try { p.Kill(); p.WaitForExit(2000); } catch { }
+                p.Dispose();
             }
         }
 
@@ -390,6 +420,10 @@ namespace Wisp
         public static void OpenExtensionPage(ExtensionInfo e)
         {
             var b = e.Profile.Browser;
+            // Secure.StartAsUser starts the browser as the signed-in user: someone else's profile would open in their name.
+            if (!b.User.IsShell)
+                throw new InvalidOperationException(L.T("Расширения пользователя «" + b.User.Name + "» открываются из его сеанса Windows",
+                                                        "Extensions of user \"" + b.User.Name + "\" can only be opened from their Windows session"));
             string exe = b.FindExe();
             if (exe == null) throw new FileNotFoundException(L.T("Не найден исполняемый файл браузера ", "Browser executable not found: ") + b.ExeName);
             string profileDir = Path.GetFileName(e.Profile.Dir);

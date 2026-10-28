@@ -1,7 +1,8 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
 namespace Wisp
@@ -41,7 +42,7 @@ namespace Wisp
             Theme.FillRound(g, p.Surface, r, Theme.S(8));
             Theme.DrawRound(g, p.Border, r, Theme.S(8));
             if (Title.Length > 0 && TitleHeight > 0)
-                TextRenderer.DrawText(g, Title, Theme.HeadFont, new Rectangle(Theme.S(18), 0, Width - Theme.S(36), TitleHeight), p.Text,
+                TextDraw.DrawText(g, Title, Theme.HeadFont, new Rectangle(Theme.S(18), 0, Width - Theme.S(36), TitleHeight), p.Text,
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
         }
     }
@@ -52,26 +53,36 @@ namespace Wisp
         readonly Tweened alpha;
         public Color? ForeOverride;
         public TextFormatFlags Flags = TextLeft;
+        string previous = "";
 
         public StatusText()
         {
             alpha = new Tweened(Invalidate, 1f);
         }
 
+        /// <summary>Changes the text: the old one fades out as the new one fades in.</summary>
         public void SetText(string text)
         {
+            text = text ?? "";
             if (text == Text) return;
+            // Mid-fade the line still mostly shows the old text: keep fading that one out.
+            if (alpha.Value >= 0.5f) previous = Text;
             Text = text;
-            alpha.Set(0.15f);
-            alpha.To(1, 260);
+            alpha.Set(0);
+            alpha.To(1, 320);
         }
 
         protected override void OnPaint(PaintEventArgs e)
         {
             Color pb = ParentBg;
             e.Graphics.Clear(pb);
-            TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle,
-                Anim.Blend(pb, ForeOverride ?? Theme.Current.TextDim, alpha.Value), Flags);
+            Color fg = ForeOverride ?? Theme.Current.TextDim;
+            float a = alpha.Value;
+            // Out, then in: the two texts never overlap.
+            if (a < 0.5f && previous.Length > 0)
+                TextDraw.DrawText(e.Graphics, previous, Font, ClientRectangle, Anim.Blend(pb, fg, 1 - a * 2), Flags);
+            if (a > 0.5f)
+                TextDraw.DrawText(e.Graphics, Text, Font, ClientRectangle, Anim.Blend(pb, fg, (a - 0.5f) * 2), Flags);
         }
     }
 
@@ -240,6 +251,18 @@ namespace Wisp
         public long Size = -1;        // -1 = not measured yet
         public bool Checked, Warn, Disabled;
         public Func<string> DisabledText;
+        /// <summary>
+        /// A link row instead of a check row: no check box, an "open" mark; a click calls this
+        /// (e.g. a newer driver on the vendor's site). Link rows never count as ticked.
+        /// </summary>
+        public Action Open;
+        /// <summary>Shown in the size column instead of a size (link rows: the vendor).</summary>
+        public string Badge;
+        /// <summary>
+        /// Link rows: the badge becomes a button that calls this (e.g. "download and install"); the rest
+        /// of the row still calls Open.
+        /// </summary>
+        public Action Act;
     }
 
     class CatGroup
@@ -255,7 +278,7 @@ namespace Wisp
             get
             {
                 long s = 0;
-                foreach (var i in Items) if (i.Checked && !i.Disabled && i.Size > 0) s += i.Size;
+                foreach (var i in Items) if (i.Checked && !i.Disabled && i.Open == null && i.Size > 0) s += i.Size;
                 return s;
             }
         }
@@ -274,7 +297,7 @@ namespace Wisp
         {
             get
             {
-                foreach (var i in Items) if (i.Size < 0 && !i.Disabled) return false;
+                foreach (var i in Items) if (i.Size < 0 && !i.Disabled && i.Open == null) return false;
                 return true;
             }
         }
@@ -308,6 +331,10 @@ namespace Wisp
         readonly object shimmerKey = new object();
         /// <summary>Shown when there are no groups and the list is not loading.</summary>
         public string EmptyText = "";
+        /// <summary>Optional glyph drawn large above EmptyText, both centred (the "all done" look).</summary>
+        public string EmptyGlyph = "";
+        /// <summary>While true, clicks do not change the ticks (an operation is running on them).</summary>
+        public bool Locked;
 
         /// <summary>While true and empty, placeholder rows shimmer in place of the groups.</summary>
         public bool Loading
@@ -337,6 +364,7 @@ namespace Wisp
             expand.Clear();
             sizeIn.Clear();
             hoverObj = null;
+            hoverAct = null;
             foreach (var g in Groups)
             {
                 expand[g] = g.Expanded ? 1 : 0;
@@ -417,7 +445,7 @@ namespace Wisp
 
         // ---------- hit testing ----------
 
-        enum Part { None, GroupCheck, GroupBody, Item }
+        enum Part { None, GroupCheck, GroupBody, Item, Act }
 
         Part HitTest(Point pt, out object obj)
         {
@@ -435,11 +463,34 @@ namespace Wisp
                 if (pt.Y >= y && pt.Y < y + block)
                 {
                     int idx = (int)((pt.Y - y) / ItemH);
-                    if (idx >= 0 && idx < g.Items.Count) { obj = g.Items[idx]; return Part.Item; }
+                    if (idx >= 0 && idx < g.Items.Count)
+                    {
+                        var item = g.Items[idx];
+                        obj = item;
+                        if (item.Act != null && !item.Disabled && ActRect(item, y + idx * ItemH, Width - S(10)).Contains(pt)) return Part.Act;
+                        return Part.Item;
+                    }
                 }
                 y += block;
             }
             return Part.None;
+        }
+
+        /// <summary>The button of a row with an Act: its caption (Badge) in a pill at the right end of the row.</summary>
+        RectangleF ActRect(CatItem item, float y, int w)
+        {
+            float bw = MeasureWidth(item.Badge ?? "", Font) + S(24);
+            return new RectangleF(w - S(32) - bw, y + S(6), bw, ItemH - S(12));
+        }
+
+        object hoverAct;
+
+        void SetHoverAct(object item)
+        {
+            if (item == hoverAct) return;
+            if (hoverAct != null) Animate(hover, Tuple.Create(hoverAct, "act"), "ha", 0, 220);
+            if (item != null) Animate(hover, Tuple.Create(item, "act"), "ha", 1, 110);
+            hoverAct = item;
         }
 
         Rectangle ThumbRect()
@@ -477,10 +528,11 @@ namespace Wisp
             bool onBar = ThumbRect().Width > 0 && e.X >= Width - S(12);
             barHover.To(onBar ? 1 : 0, onBar ? 120 : 260);
             object o = null;
-            if (!onBar) HitTest(e.Location, out o);
+            var part = onBar ? Part.None : HitTest(e.Location, out o);
             var item = o as CatItem;
             if (item != null && item.Disabled) o = null;
             SetHover(o);
+            SetHoverAct(part == Part.Act ? o : null);
             Cursor = o != null ? Cursors.Hand : Cursors.Default;
         }
 
@@ -488,6 +540,7 @@ namespace Wisp
         {
             base.OnMouseLeave(e);
             SetHover(null);
+            SetHoverAct(null);
             if (!dragging) barHover.To(0, 260);
         }
 
@@ -512,6 +565,18 @@ namespace Wisp
             var part = HitTest(e.Location, out o);
             var g = o as CatGroup;
             var item = o as CatItem;
+            if (part == Part.Act && item != null)
+            {
+                item.Act();
+                return;
+            }
+            if (part == Part.Item && item != null && item.Open != null)
+            {
+                item.Open();
+                return;
+            }
+            if (part == Part.GroupCheck && g != null && !g.Items.Exists(i => i.Open == null && !i.Disabled)) part = Part.GroupBody;
+            if (Locked && (part == Part.GroupCheck || part == Part.Item)) return;
             if (part == Part.GroupCheck && g != null)
             {
                 bool all = true;
@@ -565,8 +630,20 @@ namespace Wisp
             if (Groups.Count == 0)
             {
                 if (loading) PaintSkeleton(g, bg);
+                else if (EmptyGlyph.Length > 0 && Theme.HasGlyphs)
+                {
+                    // Accent tile with the glyph, the text under it, both in the middle of the list.
+                    int tile = S(64), top = (Height - tile - S(16) - S(40)) / 2;
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    var box = new RectangleF((Width - tile) / 2f, top, tile, tile);
+                    Theme.FillRound(g, Anim.Blend(p.SurfaceAlt, p.Accent, 0.16f), box, S(16));
+                    GlyphShape.Draw(g, EmptyGlyph, new PointF(box.X + tile / 2f, box.Y + tile / 2f), S(28), p.Accent, Math.Max(0.8f, S(1) * 1.1f));
+                    TextDraw.DrawText(g, EmptyText, Font, new Rectangle(S(16), top + tile + S(16), Width - S(32), S(40)), p.TextDim,
+                        TextFormatFlags.HorizontalCenter | TextFormatFlags.Top | TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix);
+                    g.SmoothingMode = SmoothingMode.None;
+                }
                 else if (EmptyText.Length > 0)
-                    TextRenderer.DrawText(g, EmptyText, Font, new Rectangle(0, S(24), Width, S(40)), p.TextDim, TextCenter);
+                    TextDraw.DrawText(g, EmptyText, Font, new Rectangle(0, S(24), Width, S(40)), p.TextDim, TextCenter);
                 return;
             }
             // Whole pixels everywhere: text snaps to pixels, so shapes must too or rows shimmer while moving.
@@ -648,16 +725,20 @@ namespace Wisp
             // group check box: all / some / none of the enabled items
             int on = 0, total = 0;
             float sum = 0;
+            bool links = false;
             foreach (var i in grp.Items)
             {
-                if (i.Disabled) continue;
+                if (i.Open != null) links = true;
+                if (i.Disabled || i.Open != null) continue;
                 total++;
                 if (i.Checked) on++;
                 sum += Get(check, i);
             }
             bool partial = on > 0 && on < total;
             float value = total > 0 ? sum / total : 0;
-            CheckMark.Draw(g, new RectangleF(S(18), y + (GroupH - S(18)) / 2f, S(18), S(18)), partial ? 1 : value, partial, h, total > 0, rowBg);
+            bool linkGroup = links && total == 0;
+            if (linkGroup) value = 0.6f;
+            else CheckMark.Draw(g, new RectangleF(S(18), y + (GroupH - S(18)) / 2f, S(18), S(18)), partial ? 1 : value, partial, h, total > 0, rowBg);
 
             // icon tile
             var tile = new RectangleF(S(48), y + (GroupH - S(36)) / 2f, S(36), S(36));
@@ -669,12 +750,12 @@ namespace Wisp
             int tx = S(96);
             int sizeW = S(110);
             var titleR = new Rectangle(tx, (int)y + S(10), w - tx - sizeW - S(40), S(20));
-            TextRenderer.DrawText(g, grp.Name(), Theme.UiBold, titleR, p.Text, TextLeft);
-            TextRenderer.DrawText(g, grp.Desc(), Theme.SmallFont, new Rectangle(tx, (int)y + S(30), titleR.Width, S(18)), p.TextDim, TextLeft);
+            TextDraw.DrawText(g, grp.Name(), Theme.UiBold, titleR, p.Text, TextLeft);
+            TextDraw.DrawText(g, grp.Desc(), Theme.SmallFont, new RectangleF(tx, y + S(30), titleR.Width, S(18)), p.TextDim, TextLeft);
 
             bool measured = grp.Measured;
-            string size = measured ? SizeText(grp.CheckedSize) : "…";
-            TextRenderer.DrawText(g, size, Theme.UiBold, new Rectangle(w - sizeW - S(40), (int)y, sizeW, GroupH),
+            string size = linkGroup ? "" : (measured ? SizeText(grp.CheckedSize) : "…");
+            TextDraw.DrawText(g, size, Theme.UiBold, new RectangleF(w - sizeW - S(40), y, sizeW, GroupH),
                 on == 0 ? p.TextDim : p.Text, TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
 
             // chevron rotates from "right" to "down" as the group opens
@@ -699,12 +780,22 @@ namespace Wisp
             Color text = item.Disabled ? Anim.Blend(p.TextDim, bg, 0.3f) : p.Text;
             text = Anim.Blend(bg, text, ex);
 
-            CheckMark.Draw(g, new RectangleF(S(52), y + (ItemH - S(16)) / 2f, S(16), S(16)), Get(check, item), false, h, !item.Disabled, rowBg);
+            if (item.Open != null)
+                GlyphShape.Draw(g, "\uE8A7", new PointF(S(60), y + ItemH / 2f), S(14),
+                    Anim.Blend(bg, Anim.Blend(p.TextDim, p.Accent, 0.55f + 0.45f * h), ex), Math.Max(0.6f, S(1) * 0.8f));
+            else
+                CheckMark.Draw(g, new RectangleF(S(52), y + (ItemH - S(16)) / 2f, S(16), S(16)), Get(check, item), false, h, !item.Disabled, rowBg);
             int x = S(82);
             string name = item.Name();
             int sizeW = S(110);
+            RectangleF act = RectangleF.Empty;
+            if (item.Act != null && !item.Disabled)
+            {
+                act = ActRect(item, y, w);
+                sizeW = Math.Max(sizeW, (int)(w - act.X) - S(40) + S(8));
+            }
             int maxName = w - x - sizeW - S(48);
-            TextRenderer.DrawText(g, name, Font, new Rectangle(x, (int)y, maxName, ItemH), text, TextLeft);
+            TextDraw.DrawText(g, name, Font, new RectangleF(x, y, maxName, ItemH), text, TextLeft);
             x += Math.Min(maxName, MeasureWidth(name, Font)) + S(10);
             if (item.Warn)
             {
@@ -715,14 +806,28 @@ namespace Wisp
             }
             string note = item.Disabled && item.DisabledText != null ? item.DisabledText() : (item.Note != null ? item.Note() : "");
             if (!string.IsNullOrEmpty(note) && x < w - sizeW - S(48))
-                TextRenderer.DrawText(g, note, Theme.SmallFont, new Rectangle(x, (int)y, w - sizeW - S(48) - x, ItemH),
+                TextDraw.DrawText(g, note, Theme.SmallFont, new RectangleF(x, y, w - sizeW - S(48) - x, ItemH),
                     Anim.Blend(bg, p.TextDim, ex * 0.9f), TextLeft);
 
-            if (!item.Disabled)
+            if (!act.IsEmpty)
+            {
+                // The button: accent outline, filled more as the mouse comes over it.
+                float ha = Get(hover, Tuple.Create((object)item, "act"));
+                using (var path = Theme.RoundRect(act, act.Height / 2))
+                {
+                    using (var b = new SolidBrush(Anim.Blend(bg, Anim.Blend(rowBg, p.Accent, 0.10f + 0.22f * ha), ex)))
+                        g.FillPath(b, path);
+                    using (var pen = new Pen(Anim.Blend(bg, Anim.Blend(p.Border, p.Accent, 0.55f + 0.45f * ha), ex), Math.Max(1f, S(1))))
+                        g.DrawPath(pen, path);
+                }
+                TextDraw.DrawText(g, item.Badge ?? "", Font, Rectangle.Round(act), Anim.Blend(bg, Anim.Blend(p.Accent, p.Text, ha * 0.5f), ex),
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+            }
+            else if (!item.Disabled)
             {
                 float a = item.Size < 0 ? 0.6f : (sizeIn.ContainsKey(item) ? sizeIn[item] : 1f);
                 Color sc = item.Checked ? Anim.Blend(p.TextDim, p.Text, 0.6f) : p.TextDim;
-                TextRenderer.DrawText(g, SizeText(item.Size), Font, new Rectangle(w - sizeW - S(40), (int)y, sizeW, ItemH),
+                TextDraw.DrawText(g, item.Badge ?? SizeText(item.Size), Font, new RectangleF(w - sizeW - S(40), y, sizeW, ItemH),
                     Anim.Blend(bg, sc, a * ex), TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
             }
             g.SmoothingMode = SmoothingMode.None;
@@ -734,8 +839,14 @@ namespace Wisp
     enum RingState { Scanning, Ready, Cleaning, Done }
 
     /// <summary>
-    /// The big round "clean" button: the Wisp mark drawn large. It spins while scanning, shows how
-    /// much can be freed, fills up while cleaning (dust flying off its head) and sparkles when done.
+    /// The big round "clean" button: the Wisp mark drawn large.
+    /// <para>
+    /// As in DriveUP, the ring is always one arc (where it starts and how long it is). A state only says
+    /// where the arc should be; on a change the arc travels there from wherever it is drawn now, so nothing
+    /// ever jumps: the spinning arc slows down and settles into the logo, the logo's gap opens into the
+    /// cleaning progress, a full ring unwinds back into the spinner. Dust keeps flying off the arc's head
+    /// (frozen in flight while idle), sparkles grow and shrink, the number and the caption cross-fade.
+    /// </para>
     /// </summary>
     class CleanRing : SkinControl, IScalable
     {
@@ -744,20 +855,32 @@ namespace Wisp
             if (numFont != null) numFont.Dispose();
             if (capFont != null) capFont.Dispose();
             numFont = capFont = null;
-            FitFonts((Math.Min(Width, Height) - S(24)) * 0.84f);
+            FitFonts(RingSize);
             Invalidate();
         }
 
         RingState state = RingState.Scanning;
-        float shownBytes, sweepIn = 1, sparkleIn = 1, progress, stateFade = 1;
+        bool introPending = true;
+
+        // Arc travel: from the arc shown when the state changed to the new state's arc.
+        float fromStart = Logo.SolidStart, fromSweep = 0, startOffset, travel = 1;
+        Func<float, float> travelEase = Anim.EaseInOut;
+        float lastStart = Logo.SolidStart, lastSweep;
+
+        float shownBytes, progress, dust, sparkleReady, sparkleDone, numFade = 1, capFade = 1, phase;
+        double lastPhaseAt = -1;
         long targetBytes;
+        string caption = "", prevCaption = "", prevNumber = "", lastNumber = "";
         readonly Tweened hover, press;
         readonly System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
-        readonly object frameKey = new object(), numKey = new object(), introKey = new object(), progKey = new object(), fadeKey = new object();
+        readonly object frameKey = new object(), numKey = new object(), travelKey = new object(), progKey = new object(),
+            dustKey = new object(), readyKey = new object(), doneKey = new object(), numFadeKey = new object(), capKey = new object();
         bool running;
-        public string Caption = "";
         public bool Clickable;
         Font numFont, capFont;
+
+        float RingSize { get { return (Math.Min(Width, Height) - S(24)) * 0.84f; } }
+        float Sec { get { return clock.ElapsedMilliseconds / 1000f; } }
 
         /// <summary>The ring grows with the window; its number and caption grow with it.</summary>
         void FitFonts(float ring)
@@ -780,7 +903,7 @@ namespace Wisp
         protected override void OnResize(EventArgs e)
         {
             base.OnResize(e);
-            FitFonts((Math.Min(Width, Height) - S(24)) * 0.84f);
+            FitFonts(RingSize);
         }
 
         public CleanRing()
@@ -791,44 +914,106 @@ namespace Wisp
 
         public RingState State { get { return state; } }
 
+        /// <summary>The line under the number; a new text cross-fades with the old one (out, then in).</summary>
+        public string Caption
+        {
+            get { return caption; }
+            set
+            {
+                value = value ?? "";
+                if (value == caption) return;
+                // Only the numbers changed ("cleaning… 34%" → "35%"): no new fade (one running goes on), it
+                // would flicker on every step.
+                if (Regex.Replace(value, @"\d", "") == Regex.Replace(caption, @"\d", ""))
+                {
+                    caption = value;
+                    Invalidate();
+                    return;
+                }
+                prevCaption = capFade > 0.5f ? caption : prevCaption;
+                caption = value;
+                if (!IsHandleCreated || !Visible) { Anim.Cancel(capKey); capFade = 1; Invalidate(); return; }
+                capFade = 0;
+                Anim.Run(capKey, 320, t => { capFade = t; Invalidate(); });
+            }
+        }
+
         public void SetState(RingState s)
         {
-            if (s == state) return;
+            if (s == state && !introPending) return;
+            introPending = false;
+            var prev = state;
             state = s;
-            stateFade = 0;
-            Anim.Run(fadeKey, 360, t => { stateFade = t; Invalidate(); });
-            if (s == RingState.Ready)
+
+            // The arc sets off from exactly where it is drawn now.
+            fromStart = lastStart;
+            fromSweep = lastSweep;
+            float targetStart, targetSweep;
+            Target(s, Sec, out targetStart, out targetSweep);
+            // Keep turning clockwise: the target is taken a whole number of turns ahead of the arc.
+            startOffset = 360f * (float)Math.Ceiling((fromStart - targetStart) / 360f - 0.001f);
+            int ms;
+            if (prev == RingState.Scanning && s != RingState.Scanning)
             {
-                sweepIn = 0;
-                sparkleIn = 0;
-                Anim.Run(introKey, 900, t =>
-                {
-                    sweepIn = Anim.EaseInOut(Math.Min(1, t * 1.25f));
-                    sparkleIn = t < 0.55f ? 0 : Back((t - 0.55f) / 0.45f);
-                    Invalidate();
-                }, null, x => x);
+                ms = 1000;
+                travelEase = EaseOutCubic;   // a spinning arc slows down into place
             }
-            else if (s == RingState.Done)
+            else
             {
-                sparkleIn = 0;
-                Anim.Run(introKey, 700, t => { sparkleIn = Back(t); Invalidate(); }, null, x => x);
+                ms = s == RingState.Scanning ? 650 : (s == RingState.Cleaning ? 550 : 850);
+                travelEase = Anim.EaseInOut;
             }
-            else if (s == RingState.Cleaning)
+            travel = 0;
+            Anim.Run(travelKey, ms, t => { travel = travelEase(t); Invalidate(); }, null, x => x);
+
+            // Dust flies while scanning, cleaning and when ready; a clean ring has none.
+            To(dustKey, () => dust, v => dust = v, s == RingState.Done ? 0 : 1, 450, 0);
+            // The logo's sparkle pops in once the arc has settled; the "done" sparkles likewise.
+            To(readyKey, () => sparkleReady, v => sparkleReady = v, s == RingState.Ready ? 1 : 0, s == RingState.Ready ? 650 : 260, s == RingState.Ready ? ms / 2 : 0);
+            To(doneKey, () => sparkleDone, v => sparkleDone = v, s == RingState.Done ? 1 : 0, s == RingState.Done ? 700 : 260, s == RingState.Done ? ms / 3 : 0);
+            if (s == RingState.Cleaning && prev != RingState.Cleaning)
             {
+                Anim.Cancel(progKey);
                 progress = 0;
             }
+
             bool needsFrames = s == RingState.Scanning || s == RingState.Cleaning;
             if (needsFrames && !running)
             {
                 running = true;
                 Anim.Frame(frameKey, () =>
                 {
-                    Invalidate();
+                    if (IsDisposed) return running = false;
+                    if (Visible) Invalidate();
                     running = state == RingState.Scanning || state == RingState.Cleaning;
                     return running;
                 });
             }
             Invalidate();
+        }
+
+        /// <summary>Animates a value from where it is to a target (with an optional delay); growing ones overshoot a little.</summary>
+        void To(object key, Func<float> get, Action<float> set, float target, int ms, int delay)
+        {
+            float from = get();
+            if (Math.Abs(from - target) < 0.001f) { Anim.Cancel(key); return; }
+            var expect = state;
+            Action run = () =>
+            {
+                if (state != expect) return;   // the state moved on during the delay
+                float f = get();
+                bool grow = target > f;
+                Anim.Run(key, ms, t => { set(f + (target - f) * (grow ? Back(t) : t)); Invalidate(); }, null, grow ? (Func<float, float>)(x => x) : null);
+            };
+            if (delay > 0) Anim.Delay(delay, run);
+            else run();
+        }
+
+        static float EaseOutCubic(float t)
+        {
+            t = Math.Max(0, Math.Min(1, t));
+            float u = 1 - t;
+            return 1 - u * u * u;
         }
 
         /// <summary>Overshooting ease for the sparkle "pop".</summary>
@@ -839,18 +1024,67 @@ namespace Wisp
             return 1 + c3 * (float)Math.Pow(t - 1, 3) + c1 * (float)Math.Pow(t - 1, 2);
         }
 
+        /// <summary>Where the arc of a state is at time <paramref name="sec"/> (start may run past 360).</summary>
+        void Target(RingState s, float sec, out float start, out float sweep)
+        {
+            switch (s)
+            {
+                case RingState.Scanning:
+                {
+                    // Loader: the head runs ahead during the first half of a cycle, the tail catches up in the
+                    // second; the whole arc also turns slowly. Seamless from cycle to cycle.
+                    const float period = 1.5f, reach = 250f, min = 22f;
+                    float cyc = sec / period;
+                    float k = (float)Math.Floor(cyc), u = cyc - k;
+                    float head = reach * Anim.EaseInOut(Math.Min(1, u * 2));
+                    float tail = reach * Anim.EaseInOut(Math.Max(0, u * 2 - 1));
+                    start = Logo.SolidStart + sec * 140 + k * reach + tail;
+                    sweep = min + head - tail;
+                    return;
+                }
+                case RingState.Cleaning:
+                    start = Logo.SolidStart;
+                    sweep = Math.Max(4, 360 * progress);
+                    return;
+                case RingState.Done:
+                    start = Logo.SolidStart;
+                    sweep = 360;
+                    return;
+                default:
+                    start = Logo.SolidStart;
+                    sweep = Logo.SolidSweep;
+                    return;
+            }
+        }
+
         /// <summary>The number in the middle counts to the new value.</summary>
         public void SetBytes(long bytes, bool animate = true)
         {
             targetBytes = bytes;
             float from = shownBytes;
-            if (!animate) { Anim.Cancel(numKey); shownBytes = bytes; Invalidate(); return; }
+            if (!animate)
+            {
+                // A new count (cleaning starts from zero): the old number leaves upwards, the new one comes in.
+                string before = NumberText();
+                Anim.Cancel(numKey);
+                shownBytes = bytes;
+                if (IsHandleCreated && Visible && before != NumberText() && numFade >= 1)
+                {
+                    prevNumber = before;
+                    numFade = 0;
+                    Anim.Run(numFadeKey, 380, t => { numFade = t; Invalidate(); });
+                }
+                Invalidate();
+                return;
+            }
             Anim.Run(numKey, 700, t => { shownBytes = from + (bytes - from) * t; Invalidate(); });
         }
 
+        /// <summary>Cleaning progress 0..1; the arc glides to it (it never moves backwards).</summary>
         public void SetProgress(float value)
         {
             float from = progress;
+            if (value < from) value = from;
             Anim.Run(progKey, 200, t => { progress = from + (value - from) * t; Invalidate(); });
         }
 
@@ -858,6 +1092,17 @@ namespace Wisp
         protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hover.To(0, 260); press.To(0, 160); }
         protected override void OnMouseDown(MouseEventArgs e) { base.OnMouseDown(e); if (Clickable && e.Button == MouseButtons.Left) press.To(1, 80); }
         protected override void OnMouseUp(MouseEventArgs e) { base.OnMouseUp(e); press.To(0, 220); }
+
+        static float Smooth(float a, float b, float t)
+        {
+            float x = Math.Max(0, Math.Min(1, (t - a) / (b - a)));
+            return x * x * (3 - 2 * x);
+        }
+
+        string NumberText()
+        {
+            return state == RingState.Scanning && targetBytes == 0 ? "…" : L.Size((long)Math.Round(shownBytes));
+        }
 
         protected override void OnPaint(PaintEventArgs e)
         {
@@ -868,69 +1113,111 @@ namespace Wisp
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.PixelOffsetMode = PixelOffsetMode.HighQuality;
             Cursor = Clickable ? Cursors.Hand : Cursors.Default;
+            if (!Clickable && hover.Value > 0.001f && hover.Value < 0.999f) hover.To(0, 200);
 
-            float size = Math.Min(Width, Height) - S(24);
             float scale = 1 + hover.Value * 0.02f - press.Value * 0.03f;
-            float ring = size * 0.84f * scale;
+            float ring = RingSize * scale;
+            if (ring < 4) return;
             float stroke = Math.Max(S(8), ring * 0.055f);
             var c = new PointF(Width / 2f, Height / 2f);
             float radius = ring / 2 - stroke / 2;
-            float sec = clock.ElapsedMilliseconds / 1000f;
+            float sec = Sec;
             Color violet = Logo.Violet;
 
+            // Dust drifts while the ring works and stays where it is while idle (no jump either way).
+            if (lastPhaseAt >= 0 && (state == RingState.Scanning || state == RingState.Cleaning))
+                phase = (phase + (float)(sec - lastPhaseAt) * (state == RingState.Scanning ? 1.6f : 1.4f)) % 1f;
+            lastPhaseAt = sec;
+
             // soft glow behind the ring on hover
+            Color inner = Anim.Blend(bg, violet, 0.06f * hover.Value);
             if (hover.Value > 0.01f)
-                using (var b = new SolidBrush(Anim.Blend(bg, violet, 0.06f * hover.Value)))
+                using (var b = new SolidBrush(inner))
                     g.FillEllipse(b, c.X - ring / 2 - S(6), c.Y - ring / 2 - S(6), ring + S(12), ring + S(12));
 
             // track
             using (var pen = new Pen(Anim.Blend(bg, p.IsDark ? p.SurfaceAlt : p.Pressed, 0.9f), stroke))
                 g.DrawEllipse(pen, c.X - radius, c.Y - radius, radius * 2, radius * 2);
 
-            switch (state)
+            // ----- the arc -----
+            float ts, tw;
+            Target(state, sec, out ts, out tw);
+            float start = Anim.Lerp(fromStart, ts + startOffset, travel);
+            float sweep = Math.Max(0, Anim.Lerp(fromSweep, tw, travel));
+            if (travel >= 1)
             {
-                case RingState.Scanning:
-                {
-                    // A short arc chases around the track; the head throws off dust.
-                    float rot = (sec * 300) % 360;
-                    var st = g.Save();
-                    g.TranslateTransform(c.X, c.Y);
-                    g.RotateTransform(rot);
-                    g.TranslateTransform(-c.X, -c.Y);
-                    Logo.DrawMark(g, c, ring, stroke, Color.FromArgb((int)(255 * stateFade), violet), 70, 3, (sec * 1.6f) % 1f, true, stateFade, 0);
-                    g.Restore(st);
-                    break;
-                }
-                case RingState.Ready:
-                    Logo.DrawMark(g, c, ring, stroke, violet, Logo.SolidSweep * sweepIn, 3, 0, false, sweepIn, sparkleIn);
-                    break;
-                case RingState.Cleaning:
-                    Logo.DrawMark(g, c, ring, stroke, violet, 4 + 356 * progress, 3, (sec * 1.4f) % 1f, true, Math.Min(1, (1 - progress) * 8), 0);
-                    break;
-                case RingState.Done:
-                {
-                    using (var pen = new Pen(violet, stroke)) g.DrawEllipse(pen, c.X - radius, c.Y - radius, radius * 2, radius * 2);
-                    double a1 = 225 * Math.PI / 180, a2 = 318 * Math.PI / 180;
-                    float r1 = radius + stroke * 2.2f, r2 = radius + stroke * 1.6f;
-                    Logo.DrawSparkle(g, new PointF(c.X + r1 * (float)Math.Cos(a1), c.Y + r1 * (float)Math.Sin(a1)), stroke * 1.6f * sparkleIn, violet);
-                    Logo.DrawSparkle(g, new PointF(c.X + r2 * (float)Math.Cos(a2), c.Y + r2 * (float)Math.Sin(a2)), stroke * 0.95f * Math.Max(0, sparkleIn - 0.15f), violet);
-                    break;
-                }
+                // Settled: forget the extra turns so the numbers stay small.
+                startOffset = 0;
+                start = ts;
+            }
+            lastStart = start % 360f;
+            if (lastStart < 0) lastStart += 360;
+            lastSweep = sweep;
+
+            // The mark is drawn from 12 o'clock: turned to where the arc starts now.
+            float dustNow = dust * (state == RingState.Cleaning ? Math.Min(1, (1 - progress) * 8) : 1) * Math.Min(1, sweep / 40f);
+            var st = g.Save();
+            g.TranslateTransform(c.X, c.Y);
+            g.RotateTransform(lastStart - Logo.SolidStart);
+            g.TranslateTransform(-c.X, -c.Y);
+            if (sweep >= 359.6f)
+            {
+                using (var pen = new Pen(violet, stroke)) g.DrawEllipse(pen, c.X - radius, c.Y - radius, radius * 2, radius * 2);
+                if (dustNow > 0.01f) Logo.DrawMark(g, c, ring, stroke, violet, 360, 3, phase, true, dustNow, 0);
+            }
+            else Logo.DrawMark(g, c, ring, stroke, violet, sweep, 3, phase, true, dustNow, 0);
+            g.Restore(st);
+
+            // The logo's sparkle sits in the gap at half past ten; the "done" pair outside the full ring.
+            if (sparkleReady > 0.01f) Logo.DrawMark(g, c, ring, stroke, violet, 0, 0, 0, false, 0, sparkleReady);
+            if (sparkleDone > 0.01f)
+            {
+                double a1 = 225 * Math.PI / 180, a2 = 318 * Math.PI / 180;
+                float r1 = radius + stroke * 2.2f, r2 = radius + stroke * 1.6f;
+                Logo.DrawSparkle(g, new PointF(c.X + r1 * (float)Math.Cos(a1), c.Y + r1 * (float)Math.Sin(a1)), stroke * 1.6f * sparkleDone, violet);
+                Logo.DrawSparkle(g, new PointF(c.X + r2 * (float)Math.Cos(a2), c.Y + r2 * (float)Math.Sin(a2)), stroke * 0.95f * Math.Max(0, sparkleDone - 0.15f), violet);
             }
 
-            // center: big number + caption
-            string number = state == RingState.Scanning && targetBytes == 0 ? "…" : L.Size((long)Math.Round(shownBytes));
-            if (state == RingState.Cleaning) number = L.Size((long)Math.Round(shownBytes));
-            Color fg = Anim.Blend(bg, p.Text, 0.4f + 0.6f * stateFade);
-            if (numFont == null) FitFonts((Math.Min(Width, Height) - S(24)) * 0.84f);
+            // ----- the middle: number and caption, each cross-fading out, then in -----
+            string number = NumberText();
+            bool dots = number == "…";
+            // "…" turning into a size (or back): the old one leaves upwards, once per change.
+            if (lastNumber.Length > 0 && (lastNumber == "…") != dots && numFade >= 1)
+            {
+                prevNumber = lastNumber;
+                numFade = 0;
+                Anim.Run(numFadeKey, 380, t => { numFade = t; Invalidate(); });
+            }
+            lastNumber = number;
+
+            if (numFont == null) FitFonts(RingSize);
             int bh = numFont.Height, ch = capFont.Height;
             // Number and caption are centred as one block inside the ring.
             int top = (int)Math.Round(c.Y - (bh + S(2) + ch) / 2f);
-            var numRect = new Rectangle(0, top, Width, bh);
-            TextRenderer.DrawText(g, number, numFont, numRect, fg, TextCenter);
-            int inner = (int)(radius * 2 - stroke * 2);
-            TextRenderer.DrawText(g, Caption, capFont, new Rectangle((Width - inner) / 2, numRect.Bottom + S(2), inner, ch),
-                Anim.Blend(bg, p.TextDim, stateFade), TextCenter | TextFormatFlags.EndEllipsis);
+            float shift = S(8);
+            if (numFade < 1 && prevNumber.Length > 0)
+            {
+                float outA = 1 - Smooth(0, 0.55f, numFade), inA = Smooth(0.4f, 1, numFade);
+                TextDraw.DrawText(g, prevNumber, numFont, new RectangleF(0, top - shift * numFade, Width, bh), Anim.Blend(inner, p.Text, outA), TextCenter);
+                TextDraw.DrawText(g, number, numFont, new RectangleF(0, top + shift * (1 - numFade), Width, bh), Anim.Blend(inner, p.Text, inA), TextCenter);
+            }
+            else TextDraw.DrawText(g, number, numFont, new Rectangle(0, top, Width, bh), p.Text, TextCenter);
+
+            int innerW = (int)(radius * 2 - stroke * 2);
+            var capRect = new Rectangle((Width - innerW) / 2, top + bh + S(2), innerW, ch);
+            if (capFade < 1 && prevCaption.Length > 0)
+                TextDraw.DrawText(g, prevCaption, capFont, capRect, Anim.Blend(inner, p.TextDim, 1 - Smooth(0, 0.5f, capFade)), TextCenter | TextFormatFlags.EndEllipsis);
+            TextDraw.DrawText(g, caption, capFont, capRect, Anim.Blend(inner, p.TextDim, Smooth(0.5f, 1, capFade)), TextCenter | TextFormatFlags.EndEllipsis);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (numFont != null) numFont.Dispose();
+                if (capFont != null) capFont.Dispose();
+            }
+            base.Dispose(disposing);
         }
     }
 }

@@ -15,6 +15,9 @@ namespace Wisp
 
     static class Theme
     {
+        /// <summary>Height of buttons, switches and search fields, in design pixels: one row lines up.</summary>
+        public const int ControlH = 36;
+
         public static readonly Palette Dark = new Palette
         {
             IsDark = true,
@@ -73,7 +76,7 @@ namespace Wisp
                 // Font sizes are in points, which GDI already scales by DPI: only the zoom applies here.
                 f = new[]
                 {
-                    new Font("Segoe UI", 9.5f * zoom), new Font("Segoe UI Semibold", 9.5f * zoom), new Font("Segoe UI", 8.5f * zoom),
+                    new Font("Segoe UI", 9.5f * zoom), new Font("Segoe UI Semibold", 9.5f * zoom), new Font("Segoe UI", 9f * zoom),
                     new Font("Segoe UI Semibold", 13f * zoom), new Font("Segoe UI Semibold", 11f * zoom), new Font("Segoe UI Semibold", 24f * zoom),
                     new Font("Segoe MDL2 Assets", 10f * zoom), new Font("Segoe MDL2 Assets", 8f * zoom),
                     new Font("Segoe MDL2 Assets", 14f * zoom), new Font("Segoe MDL2 Assets", 26f * zoom),

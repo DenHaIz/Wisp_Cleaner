@@ -8,9 +8,9 @@
 
 Очистка диска Windows в одном портативном `.exe`.
 
-- **Очистка** — временные файлы, кэш, обновления, корзина. Одной кнопкой или по категориям.
+- **Очистка** — временные файлы и кэш всех пользователей, обновления, корзина. Одной кнопкой или по категориям.
 - **Автоочистка** — по расписанию или при нехватке места (по умолчанию выключена).
-- **Программы** — удаление классических и Store-приложений вместе с остатками.
+- **Программы** — удаление классических и Store-приложений вместе с остатками. Принудительное удаление тех, что не удаляются, и чистка реестра.
 - **Браузеры** — кэш, cookie, история по профилям. Пароли и закладки не трогаются.
 - **Файлы** — большие файлы и дубликаты. Удаление только в Корзину.
 
@@ -22,9 +22,9 @@
 
 Disk cleaner for Windows in a single portable `.exe`.
 
-- **Clean** — temp files, caches, updates, Recycle Bin. One click or by category.
+- **Clean** — temp files and caches of all users, updates, Recycle Bin. One click or by category.
 - **Auto-clean** — on a schedule or when disk space runs low (off by default).
-- **Programs** — uninstall desktop and Store apps, including leftovers.
+- **Programs** — uninstall desktop and Store apps, including leftovers. Force-remove the ones that won't uninstall; registry clean-up.
 - **Browsers** — cache, cookies, history per profile. Passwords and bookmarks stay untouched.
 - **Files** — large files and duplicates. Deleted to the Recycle Bin only.
 

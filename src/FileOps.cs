@@ -51,12 +51,36 @@ namespace Wisp
             }
             if (!string.IsNullOrEmpty(profile)) forbidden.Add(Norm(Path.Combine(profile, @"AppData\LocalLow")));
             foreach (var d in DriveInfo.GetDrives()) forbidden.Add(Norm(d.Name));
+
+            // The same well-known folders of every other profile, the shared Start menu and desktop.
+            foreach (var u in UserProfiles.All)
+            {
+                foreach (string rel in new[] { "", "AppData", @"AppData\LocalLow", "Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos", "OneDrive", "Favorites" })
+                    forbidden.Add(Norm(Path.Combine(u.Dir, rel)));
+                foreach (string rel in new[] { "", "Programs", "Microsoft", "Packages" }) forbidden.Add(Norm(Path.Combine(u.Local, rel)));
+                foreach (string rel in new[] { "", "Microsoft", @"Microsoft\Windows\Start Menu", @"Microsoft\Windows\Start Menu\Programs", @"Microsoft\Windows\Start Menu\Programs\Startup" })
+                    forbidden.Add(Norm(Path.Combine(u.Roaming, rel)));
+            }
+            foreach (var f in new[] { Environment.SpecialFolder.CommonStartMenu, Environment.SpecialFolder.CommonPrograms, Environment.SpecialFolder.CommonStartup,
+                                      Environment.SpecialFolder.CommonDesktopDirectory, Environment.SpecialFolder.StartMenu, Environment.SpecialFolder.Programs,
+                                      Environment.SpecialFolder.Startup, Environment.SpecialFolder.DesktopDirectory })
+            {
+                string p = Environment.GetFolderPath(f);
+                if (!string.IsNullOrEmpty(p)) forbidden.Add(Norm(p));
+            }
+            string common = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+            if (!string.IsNullOrEmpty(common)) forbidden.Add(Norm(Path.Combine(common, "Microsoft")));
         }
 
         public static string Norm(string p)
         {
             try { p = Path.GetFullPath(p); } catch { }
             return p.TrimEnd('\\') + "\\";
+        }
+
+        public static bool SamePath(string a, string b)
+        {
+            return string.Equals(Norm(a), Norm(b), StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>True when the folder may be a cleaning root: deep enough and not a well-known system or user folder.</summary>

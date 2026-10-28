@@ -54,7 +54,7 @@ namespace Wisp
 
             extCard.TitleBase = 48;
             btnOpenExt = Button("\uE8A7", ButtonKind.Ghost);
-            btnOpenExt.SetBaseHeight(30);
+            btnOpenExt.SetBaseHeight(32);
             btnOpenExt.Click += (s, e) => OpenExtension();
             lvExt.MultiSelect = false;
             lvExt.Numeric = new[] { false, false, false, true };
@@ -104,10 +104,10 @@ namespace Wisp
 
         void LayoutToolbar()
         {
-            int x = S(16), y = (toolbar.Height - S(32)) / 2;
+            int x = S(16), y = (toolbar.Height - S(Theme.ControlH)) / 2;
             btnClean.Location = new Point(x, y);
             btnRefresh.Location = new Point(btnClean.Right + S(8), y);
-            note.SetBounds(btnRefresh.Right + S(20), y, Math.Max(S(50), toolbar.Width - btnRefresh.Right - S(36)), S(32));
+            note.SetBounds(btnRefresh.Right + S(20), y, Math.Max(S(50), toolbar.Width - btnRefresh.Right - S(36)), S(Theme.ControlH));
         }
 
         public override void ApplyTheme()
@@ -270,6 +270,7 @@ namespace Wisp
             var ext = row != null ? ((ExtRow)row.Tag).Ext : null;
             if (ext == null) return;
             try { Browsers.OpenExtensionPage(ext); }
+            catch (InvalidOperationException ex) { Host.ShowToast(ex.Message, ToastKind.Info); }
             catch (Exception ex) { Host.ShowToast(L.T("Не удалось открыть браузер: ", "Could not open the browser: ") + ex.Message, ToastKind.Error); }
         }
 

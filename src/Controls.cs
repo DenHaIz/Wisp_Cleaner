@@ -53,13 +53,13 @@ namespace Wisp
         protected static int MeasureWidth(string text, Font font)
         {
             return string.IsNullOrEmpty(text) ? 0
-                : TextRenderer.MeasureText(text, font, Size.Empty, TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix).Width;
+                : TextDraw.MeasureText(text, font, Size.Empty, TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix).Width;
         }
 
         protected static void DrawGlyph(Graphics g, string glyph, Rectangle r, Color c, Font font = null)
         {
             if (!Theme.HasGlyphs || string.IsNullOrEmpty(glyph)) return;
-            TextRenderer.DrawText(g, glyph, font ?? Theme.Glyph, r, c, TextCenter);
+            TextDraw.DrawText(g, glyph, font ?? Theme.Glyph, r, c, TextCenter);
         }
     }
 
@@ -71,7 +71,7 @@ namespace Wisp
         public string Glyph;
         public ButtonKind Kind;
         /// <summary>Height in design pixels; the real height follows the zoom.</summary>
-        int baseHeight = 32;
+        int baseHeight = Theme.ControlH;
 
         public void SetBaseHeight(int h)
         {
@@ -96,7 +96,7 @@ namespace Wisp
             press = new Tweened(Invalidate);
             enabledT = new Tweened(Invalidate, 1f);
             appear = new Tweened(Invalidate, 1f);
-            Height = S(32);
+            Height = S(baseHeight);
             Width = PreferredWidth;
         }
 
@@ -136,7 +136,28 @@ namespace Wisp
             Cursor = Enabled ? Cursors.Hand : Cursors.Default;
         }
 
-        protected override void OnTextChanged(EventArgs e) { base.OnTextChanged(e); Invalidate(); }
+        string shownText = "", oldText = "";
+        float textFade = 1;
+        readonly object textKey = new object();
+
+        protected override void OnTextChanged(EventArgs e)
+        {
+            base.OnTextChanged(e);
+            // A visible button cross-fades its caption ("Check" → "Install (3)"); a hidden one just changes.
+            if (Visible && IsHandleCreated && shownText.Length > 0 && Text.Length > 0)
+            {
+                oldText = shownText;
+                textFade = 0;
+                Anim.Run(textKey, 220, t => { textFade = t; Invalidate(); });
+            }
+            else
+            {
+                Anim.Cancel(textKey);
+                textFade = 1;
+            }
+            shownText = Text;
+            Invalidate();
+        }
 
         protected override void OnPaint(PaintEventArgs e)
         {
@@ -199,7 +220,17 @@ namespace Wisp
                 x += S(16) + S(8);
             }
             if (Text.Length > 0)
-                TextRenderer.DrawText(g, Text, Font, new Rectangle(x, 0, Width - x - S(4), Height), fg, TextLeft);
+            {
+                var tr = new Rectangle(x, 0, Width - x - S(4), Height);
+                if (textFade < 1)
+                {
+                    // Old caption slides up and out, the new one comes up from below.
+                    int dy = (int)Math.Round(S(6) * textFade);
+                    TextDraw.DrawText(g, oldText, Font, new Rectangle(tr.X, tr.Y - dy, tr.Width, tr.Height), Anim.Blend(bg, fg, 1 - textFade), TextLeft);
+                    TextDraw.DrawText(g, Text, Font, new Rectangle(tr.X, tr.Y + S(6) - dy, tr.Width, tr.Height), Anim.Blend(bg, fg, textFade), TextLeft);
+                }
+                else TextDraw.DrawText(g, Text, Font, tr, fg, TextLeft);
+            }
         }
     }
 
@@ -256,7 +287,31 @@ namespace Wisp
             Invalidate();
         }
 
-        int GlyphSpace { get { return Theme.HasGlyphs ? S(16) + S(8) : 0; } }
+        int GlyphSpace { get { return Theme.HasGlyphs ? S(20) + S(8) : 0; } }
+
+        static FontFamily glyphFamily;
+
+        /// <summary>
+        /// Tab icons: a little larger than the text and drawn as an outlined shape, so MDL2's hairline strokes
+        /// (the font has no bold) read as heavy as the bold tab names.
+        /// </summary>
+        static void DrawBoldGlyph(Graphics g, string glyph, Rectangle r, Color c)
+        {
+            if (!Theme.HasGlyphs || string.IsNullOrEmpty(glyph)) return;
+            if (glyphFamily == null) glyphFamily = new FontFamily("Segoe MDL2 Assets");
+            using (var path = new GraphicsPath())
+            {
+                path.AddString(glyph, glyphFamily, (int)FontStyle.Regular, 17f * Theme.Scale, PointF.Empty, StringFormat.GenericTypographic);
+                var b = path.GetBounds();
+                using (var m = new Matrix())
+                {
+                    m.Translate((float)Math.Round(r.X + (r.Width - b.Width) / 2f - b.X), (float)Math.Round(r.Y + (r.Height - b.Height) / 2f - b.Y));
+                    path.Transform(m);
+                }
+                using (var brush = new SolidBrush(c)) g.FillPath(brush, path);
+                using (var pen = new Pen(c, 0.85f * Theme.Scale) { LineJoin = LineJoin.Round }) g.DrawPath(pen, path);
+            }
+        }
 
         void Relayout()
         {
@@ -355,10 +410,10 @@ namespace Wisp
                 int x = r.X + S(16);
                 if (Theme.HasGlyphs)
                 {
-                    DrawGlyph(g, glyphs[i], new Rectangle(x, 0, S(16), r.Height), Anim.Blend(c, p.Accent, s));
+                    DrawBoldGlyph(g, glyphs[i], new Rectangle(x, 0, S(20), r.Height), Anim.Blend(c, p.Accent, s));
                     x += GlyphSpace;
                 }
-                TextRenderer.DrawText(g, tabs[i], Font, new Rectangle(x, 0, r.Right - x, r.Height), c, TextLeft);
+                TextDraw.DrawText(g, tabs[i], Font, new Rectangle(x, 0, r.Right - x, r.Height), c, TextLeft);
             }
             Theme.FillRound(g, p.Accent, new RectangleF(indX, Height - S(3), indW, S(3)), S(2));
         }
@@ -443,7 +498,7 @@ namespace Wisp
             float kx = Anim.Lerp(tr.X + S(4), tr.Right - S(4) - d, k);
             using (var b = new SolidBrush(Anim.Blend(Anim.Blend(p.TextDim, Color.White, k), pb, dim)))
                 g.FillEllipse(b, kx, tr.Y + S(4), d, d);
-            TextRenderer.DrawText(g, Text, Font, new Rectangle(tw + S(10), 0, Width - tw - S(10), Height),
+            TextDraw.DrawText(g, Text, Font, new Rectangle(tw + S(10), 0, Width - tw - S(10), Height),
                 Anim.Blend(Anim.Blend(p.TextDim, p.Text, Math.Max(h, k)), pb, dim), TextLeft);
         }
     }
@@ -482,12 +537,32 @@ namespace Wisp
             Invalidate();
         }
 
+        /// <summary>Left edge and width of each segment: as wide as its own text, so short ones take no extra room.</summary>
+        float[] segX = new float[0], segW = new float[0];
+
         void FitSize()
         {
-            int seg = 0;
-            foreach (string t in texts) seg = Math.Max(seg, MeasureWidth(t, Font));
-            seg += S(28) + (HasGlyphs ? S(22) : 0);
-            Size = new Size(seg * texts.Length + S(6), S(32));
+            segX = new float[texts.Length];
+            segW = new float[texts.Length];
+            // Equal pads, but never narrower than a glyph-only segment.
+            float x = S(3);
+            for (int i = 0; i < texts.Length; i++)
+            {
+                segX[i] = x;
+                segW[i] = Math.Max(S(40), MeasureWidth(texts[i], Font) + S(32) + (HasGlyphs ? S(22) : 0));
+                x += segW[i];
+            }
+            Size = new Size((int)Math.Ceiling(x) + S(3), S(Theme.ControlH));
+        }
+
+        /// <summary>Where the selection pill is for a fractional position (it slides and resizes between segments).</summary>
+        void PillAt(float at, out float x, out float w)
+        {
+            int a = Math.Max(0, Math.Min(texts.Length - 1, (int)Math.Floor(at)));
+            int b = Math.Min(texts.Length - 1, a + 1);
+            float t = Math.Max(0, Math.Min(1, at - a));
+            x = Anim.Lerp(segX[a], segX[b], t);
+            w = Anim.Lerp(segW[a], segW[b], t);
         }
 
         public int SelectedIndex
@@ -503,8 +578,6 @@ namespace Wisp
             }
         }
 
-        float SegWidth { get { return (Width - S(6)) / (float)texts.Length; } }
-
         bool HasGlyphs
         {
             get
@@ -517,8 +590,9 @@ namespace Wisp
 
         int HitTest(Point pt)
         {
-            int i = (int)((pt.X - S(3)) / SegWidth);
-            return i >= 0 && i < texts.Length ? i : -1;
+            for (int i = 0; i < texts.Length; i++)
+                if (pt.X >= segX[i] && pt.X < segX[i] + segW[i]) return i;
+            return -1;
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
@@ -564,21 +638,22 @@ namespace Wisp
             var outer = new RectangleF(0.5f, 0.5f, Width - 1, Height - 1);
             Theme.FillRound(g, Anim.Blend(p.SurfaceAlt, pb, dim), outer, S(8));
             Theme.DrawRound(g, Anim.Blend(p.Border, pb, dim), outer, S(8));
-            float sw = SegWidth;
-            Theme.FillRound(g, Anim.Blend(Anim.Blend(p.Accent, p.Pressed, dim), pb, dim), new RectangleF(S(3) + pill * sw, S(3), sw, Height - S(6)), S(6));
+            float px, pw;
+            PillAt(pill, out px, out pw);
+            Theme.FillRound(g, Anim.Blend(Anim.Blend(p.Accent, p.Pressed, dim), pb, dim), new RectangleF(px, S(3), pw, Height - S(6)), S(6));
             for (int i = 0; i < texts.Length; i++)
             {
                 float on = Math.Max(0, 1 - Math.Abs(pill - i));
                 Color c = Anim.Blend(Anim.Blend(Anim.Blend(p.TextDim, p.Text, Enabled ? hovers[i].Value : 0), p.AccentText, on), pb, dim);
-                int x0 = (int)(S(3) + i * sw);
-                int content = MeasureWidth(texts[i], Font) + (HasGlyphs ? S(22) : 0);
-                int x = x0 + (int)((sw - content) / 2);
+                float sw = segW[i];
+                int content = MeasureWidth(texts[i], Font) + (HasGlyphs && texts[i].Length > 0 ? S(22) : 0) + (HasGlyphs && texts[i].Length == 0 ? S(16) : 0);
+                int x = (int)Math.Round(segX[i] + (sw - content) / 2);
                 if (HasGlyphs)
                 {
                     DrawGlyph(g, glyphs[i], new Rectangle(x, 0, S(16), Height), c);
                     x += S(22);
                 }
-                TextRenderer.DrawText(g, texts[i], Font, new Rectangle(x, 0, (int)sw, Height), c, TextLeft);
+                TextDraw.DrawText(g, texts[i], Font, new RectangleF(x, 0, sw, Height), c, TextLeft);
             }
         }
     }
@@ -588,7 +663,7 @@ namespace Wisp
     {
         public void ApplyScale()
         {
-            Height = S(32);
+            Height = S(Theme.ControlH);
             PerformLayout();
         }
 
@@ -616,7 +691,7 @@ namespace Wisp
             box.HandleCreated += (s, e) => SendMessage(box.Handle, 0x1501, (IntPtr)1, cue);
             Controls.Add(box);
             Cursor = Cursors.IBeam;
-            Size = new Size(S(300), S(32));
+            Size = new Size(S(300), S(Theme.ControlH));
         }
 
         public override string Text
@@ -801,7 +876,7 @@ namespace Wisp
             Theme.FillRound(g, accent, new RectangleF(0, 0, S(4), Height), 0);
             string glyph = kind == ToastKind.Error ? "\uE783" : (kind == ToastKind.Success ? "\uE930" : "\uE946");
             DrawGlyph(g, glyph, new Rectangle(S(16), 0, S(18), Height), accent);
-            TextRenderer.DrawText(g, Text, Font, new Rectangle(S(44), 0, Width - S(56), Height), fg, TextLeft);
+            TextDraw.DrawText(g, Text, Font, new Rectangle(S(44), 0, Width - S(56), Height), fg, TextLeft);
         }
     }
 }

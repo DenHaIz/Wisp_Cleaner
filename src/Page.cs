@@ -99,9 +99,9 @@ namespace Wisp
             b.Width = b.PreferredWidth;
         }
 
-        protected static Label Heading()
+        protected static SmoothLabel Heading()
         {
-            return new Label { AutoSize = false, Font = Theme.HeadFont, TextAlign = ContentAlignment.MiddleLeft, UseMnemonic = false };
+            return new SmoothLabel { AutoSize = false, Font = Theme.HeadFont, TextAlign = ContentAlignment.MiddleLeft, UseMnemonic = false };
         }
     }
 }

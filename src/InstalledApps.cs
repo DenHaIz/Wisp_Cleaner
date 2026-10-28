@@ -39,16 +39,47 @@ namespace Wisp
         public string KeyPath = "", KeyName = "";
         public string UninstallString = "", QuietUninstallString = "";
         public bool IsMsi;
+        public string UserSid;           // per-user entry: whose (null for programs installed for everyone)
+        public bool Broken;              // the uninstaller is gone: only forced removal helps
 
         // Store
         public string PackageFullName = "", PackageFamilyName = "";
 
         public RowKind RowKind { get { return Failed ? RowKind.Danger : RowKind.Normal; } }
         public string IconPath { get { return Icon; } }
-        public int Dot { get { return 0; } }
+        public int Dot { get { return Broken && !Failed ? 3 : 0; } }
 
-        public string KindText { get { return Kind == AppKind.Store ? "Microsoft Store" : L.T("Классическая", "Desktop"); } }
+        public UserProfile User { get { return UserProfiles.BySid(UserSid); } }
+
+        public string KindText
+        {
+            get
+            {
+                if (Kind == AppKind.Store) return "Microsoft Store";
+                var u = User;
+                return L.T("Классическая", "Desktop") + (u != null && UserProfiles.Many ? " · " + u.Name : "");
+            }
+        }
+
         public bool CanQuiet { get { return Kind == AppKind.Store || IsMsi || QuietUninstallString.Length > 0; } }
+
+        /// <summary>
+        /// Whether the program's own uninstaller can be run: it exists, and a per-user one belongs to the
+        /// signed-in user or to this app's account (it cannot be started in another user's name).
+        /// </summary>
+        public bool CanRunUninstaller
+        {
+            get
+            {
+                if (Kind == AppKind.Store) return true;
+                if (Broken) return false;
+                return UserSid == null || string.Equals(UserSid, Secure.ShellSid, StringComparison.OrdinalIgnoreCase) ||
+                       string.Equals(UserSid, Secure.SelfSid, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        /// <summary>The uninstall entry as shown in regedit (WOW6432Node for 32-bit entries).</summary>
+        public string RegistryPath { get { return Reg.Display(Hive, View, KeyPath + "\\" + KeyName); } }
 
         public bool StillInstalled()
         {
@@ -70,22 +101,27 @@ namespace Wisp
         static readonly Regex KbName = new Regex(@"^KB\d+", RegexOptions.IgnoreCase);
         static readonly Regex Guid = new Regex(@"^\{[0-9A-F\-]{36}\}$", RegexOptions.IgnoreCase);
 
+        /// <summary>
+        /// Programs for everyone (both registry views), this account's own, and — as administrator —
+        /// those of the other users who are signed in (their registry is loaded under HKEY_USERS).
+        /// </summary>
         public static List<InstalledApp> Load()
         {
             var list = new List<InstalledApp>();
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var sources = new[]
+            var sources = new List<Tuple<RegistryHive, RegistryView, string, string>>
             {
-                Tuple.Create(RegistryHive.LocalMachine, RegistryView.Registry64),
-                Tuple.Create(RegistryHive.LocalMachine, RegistryView.Registry32),
-                Tuple.Create(RegistryHive.CurrentUser, RegistryView.Registry64),
+                Tuple.Create(RegistryHive.LocalMachine, RegistryView.Registry64, "", (string)null),
+                Tuple.Create(RegistryHive.LocalMachine, RegistryView.Registry32, "", (string)null),
             };
+            foreach (var u in Reg.UserRoots())
+                sources.Add(Tuple.Create(u.Hive, RegistryView.Registry64, u.Prefix, u.Sid));
             foreach (var src in sources)
             {
                 try
                 {
                     using (var b = RegistryKey.OpenBaseKey(src.Item1, src.Item2))
-                    using (var root = b.OpenSubKey(UninstallPath))
+                    using (var root = b.OpenSubKey(src.Item3 + UninstallPath))
                     {
                         if (root == null) continue;
                         foreach (string name in root.GetSubKeyNames())
@@ -94,8 +130,14 @@ namespace Wisp
                             {
                                 using (var k = root.OpenSubKey(name))
                                 {
-                                    var app = Read(k, name, src.Item1, src.Item2);
-                                    if (app != null && seen.Add(app.Name + "|" + app.Version)) list.Add(app);
+                                    var app = Read(k, name, src.Item1, src.Item2, src.Item4);
+                                    if (app == null) continue;
+                                    app.KeyPath = src.Item3 + UninstallPath;
+                                    app.UserSid = src.Item4;
+                                    // The same program in both views or for everyone and this account is listed once;
+                                    // other users' own copies are listed separately.
+                                    bool own = src.Item4 == null || string.Equals(src.Item4, Secure.SelfSid, StringComparison.OrdinalIgnoreCase);
+                                    if (seen.Add(app.Name + "|" + app.Version + (own ? "" : "|" + src.Item4))) list.Add(app);
                                 }
                             }
                             catch { }
@@ -107,15 +149,37 @@ namespace Wisp
             return list;
         }
 
-        static string Str(RegistryKey k, string name)
+        [System.Runtime.InteropServices.DllImport("msi.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        static extern int MsiQueryProductState(string product);
+
+        /// <summary>
+        /// True when the uninstaller surely cannot run: its file is gone from a local disk, or Windows
+        /// Installer no longer knows the product.
+        /// </summary>
+        static bool IsBroken(InstalledApp app)
         {
-            var v = k.GetValue(name);
-            return v != null ? v.ToString().Trim() : "";
+            if (app.IsMsi)
+            {
+                if (app.Hive != RegistryHive.LocalMachine) return false;
+                try { return MsiQueryProductState(app.KeyName) == -1; } // INSTALLSTATE_UNKNOWN
+                catch { return false; }
+            }
+            string cmd = app.QuietUninstallString.Length > 0 ? app.QuietUninstallString : app.UninstallString;
+            return PathCheck.IsMissing(cmd, app.View == RegistryView.Registry32);   // values are already expanded for their user
         }
 
-        static InstalledApp Read(RegistryKey k, string keyName, RegistryHive hive, RegistryView view)
+        /// <summary>A value with %VARS% expanded for the user whose registry it is (sid null: the machine's).</summary>
+        static string Str(RegistryKey k, string name, string sid)
+        {
+            var v = k.GetValue(name, null, RegistryValueOptions.DoNotExpandEnvironmentNames);
+            if (v == null) return "";
+            return v is string ? UserProfiles.Expand(((string)v).Trim(), sid).Trim() : v.ToString().Trim();
+        }
+
+        static InstalledApp Read(RegistryKey k, string keyName, RegistryHive hive, RegistryView view, string sid)
         {
             if (k == null) return null;
+            Func<RegistryKey, string, string> Str = (key, value) => Win32Apps.Str(key, value, sid);
             string name = Str(k, "DisplayName");
             if (name.Length == 0) return null;
             if (Str(k, "SystemComponent") == "1" || Str(k, "ParentKeyName").Length > 0) return null;
@@ -130,7 +194,7 @@ namespace Wisp
             {
                 Kind = AppKind.Win32, Name = name, Publisher = Str(k, "Publisher"), Version = Str(k, "DisplayVersion"),
                 Hive = hive, View = view, KeyPath = UninstallPath, KeyName = keyName,
-                UninstallString = uninstall, QuietUninstallString = quiet, IsMsi = msi,
+                UninstallString = uninstall, QuietUninstallString = quiet, IsMsi = msi, UserSid = sid,
                 InstallLocation = Str(k, "InstallLocation").Trim('"'),
             };
             object est = k.GetValue("EstimatedSize");
@@ -144,6 +208,7 @@ namespace Wisp
                 if (exe.Length > 0 && !Path.GetFileName(exe).Equals("msiexec.exe", StringComparison.OrdinalIgnoreCase)) icon = exe;
             }
             app.Icon = icon.Length > 0 ? icon : null;
+            app.Broken = IsBroken(app);
             return app;
         }
 
@@ -199,6 +264,7 @@ namespace Wisp
         /// </summary>
         public static bool Uninstall(InstalledApp app, Func<bool> cancel)
         {
+            if (!app.CanRunUninstaller) return false;
             string exe, args;
             bool interactive = false;
             if (app.IsMsi)
@@ -223,10 +289,19 @@ namespace Wisp
                     args = Regex.Replace(args, @"/I\s*\{", "/X{", RegexOptions.IgnoreCase);
             }
 
-            if (app.Hive == RegistryHive.CurrentUser)
+            if (app.UserSid != null && string.Equals(app.UserSid, Secure.ShellSid, StringComparison.OrdinalIgnoreCase))
             {
                 // A per-user entry can be written without administrator rights: never run it elevated.
                 Secure.WaitAndClose(Secure.StartAsUser(exe, args, true));
+            }
+            else if (app.UserSid != null)
+            {
+                // This app's own account, entered at the UAC prompt (not the signed-in user): its entry,
+                // its rights. Programs of other users never get here (CanRunUninstaller).
+                using (var p = Process.Start(new ProcessStartInfo(exe, args) { UseShellExecute = false, CreateNoWindow = !interactive }))
+                {
+                    if (p != null) p.WaitForExit();
+                }
             }
             else
             {
@@ -415,25 +490,62 @@ namespace Wisp
         }
     }
 
-    /// <summary>What a removed program may have left behind: its folders and registry keys.</summary>
-    class Leftover : IRowInfo, ICheckRow, ISortable
+    /// <summary>
+    /// What stays installed, for removals to keep away from: every folder another program lives in (its
+    /// InstallLocation and the folders of its uninstaller and icon) and the names its settings go under.
+    /// </summary>
+    class Keep
     {
-        public IComparable SortKey(int column) { return column == 2 ? (IComparable)Size : null; }
+        public readonly List<string> Folders = new List<string>();   // normalized, ending with "\"
+        public readonly HashSet<string> Names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        public string Path = "";
-        public bool IsRegistry;
-        public RegistryHive Hive;
-        public RegistryView View;
-        public string SubKey = "";
-        public long Size;
-        public string App = "";
-        public bool Checked { get; set; }
-        public bool Checkable { get { return true; } }
-        public RowKind RowKind { get { return RowKind.Normal; } }
-        public string IconPath { get { return null; } }
-        public int Dot { get { return 0; } }
+        public static Keep From(IEnumerable<InstalledApp> staying)
+        {
+            var k = new Keep();
+            string win = FileOps.Norm(Environment.GetFolderPath(Environment.SpecialFolder.Windows));
+            foreach (var a in staying)
+            {
+                k.Names.Add(Leftovers.CleanName(a.Name));
+                var dirs = new List<string>();
+                if (a.InstallLocation.Length > 0) dirs.Add(a.InstallLocation);
+                foreach (string cmd in new[] { a.UninstallString, a.QuietUninstallString, a.Icon })
+                {
+                    string exe = PathCheck.ExePath(cmd);
+                    if (string.IsNullOrEmpty(exe)) continue;
+                    try { dirs.Add(Path.GetDirectoryName(exe)); } catch { }
+                }
+                foreach (string d in dirs)
+                {
+                    try
+                    {
+                        if (string.IsNullOrEmpty(d) || d.IndexOf('%') >= 0 || d.Length < 4) continue;
+                        string n = FileOps.Norm(d.Trim('"'));
+                        // Program Files itself, a profile or Windows says nothing about one program.
+                        if (n.StartsWith(win, StringComparison.OrdinalIgnoreCase) || !FileOps.IsSafeRoot(n)) continue;
+                        if (!k.Folders.Contains(n, StringComparer.OrdinalIgnoreCase)) k.Folders.Add(n);
+                    }
+                    catch { }
+                }
+            }
+            return k;
+        }
+
+        /// <summary>Another program lives in this folder, or the folder lies inside another program's.</summary>
+        public bool Touches(string folder)
+        {
+            string n = FileOps.Norm(folder);
+            return Folders.Any(o => o.StartsWith(n, StringComparison.OrdinalIgnoreCase) || n.StartsWith(o, StringComparison.OrdinalIgnoreCase));
+        }
+
+        /// <summary>Another program lives inside this folder (it cannot be offered at all).</summary>
+        public bool Contains(string folder)
+        {
+            string n = FileOps.Norm(folder);
+            return Folders.Any(o => o.StartsWith(n, StringComparison.OrdinalIgnoreCase));
+        }
     }
 
+    /// <summary>What a removed program may have left behind: its folders and registry keys.</summary>
     static class Leftovers
     {
         static readonly HashSet<string> generic = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -443,7 +555,15 @@ namespace Wisp
             "Wow6432Node", "Clients", "RegisteredApplications", "Software", "Microsoft Office", "Windows Kits", "dotnet", "Realtek",
         };
 
-        static string CleanName(string name)
+        /// <summary>Folders shared by many programs: never taken as one program's folder.</summary>
+        static readonly HashSet<string> shared = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "InstallShield Installation Information", "Package Cache", "Common Files", "Program Files", "Program Files (x86)",
+            "ProgramData", "Users", "Windows", "Microsoft", "Installer", "Downloaded Installations", "Uninstall Information",
+            "Programs", "Apps", "Tools", "Games", "Software", "Setup", "Temp", "AppData", "Local", "Roaming", "LocalLow",
+        };
+
+        public static string CleanName(string name)
         {
             string s = Regex.Replace(name ?? "", @"\s*\([^)]*\)", "");
             s = Regex.Replace(s, @"\s+v?\d+([\.\-]\d+)*.*$", "");
@@ -463,18 +583,45 @@ namespace Wisp
                    name.IndexOfAny(System.IO.Path.GetInvalidFileNameChars()) < 0;
         }
 
-        /// <summary>True when a folder name shares a word (3+ letters) with the program's name or publisher.</summary>
-        static bool LooksLike(string folder, string name, string publisher)
+        static IEnumerable<string> Words(string s)
         {
-            var words = Regex.Split((name ?? "") + " " + (publisher ?? ""), @"[^\p{L}\p{N}]+").Where(w => w.Length >= 3);
+            return Regex.Split(s ?? "", @"[^\p{L}\p{N}]+").Where(w => w.Length > 0);
+        }
+
+        /// <summary>True when a folder name shares a word (3+ letters) with the program's name or publisher (a loose match).</summary>
+        public static bool LooksLike(string folder, string name, string publisher)
+        {
+            if (string.IsNullOrEmpty(folder) || generic.Contains(folder) || shared.Contains(folder)) return false;
+            var words = Words((name ?? "") + " " + (publisher ?? "")).Where(w => w.Length >= 3 && !generic.Contains(w));
             return words.Any(w => folder.IndexOf(w, StringComparison.OrdinalIgnoreCase) >= 0);
         }
 
         /// <summary>
-        /// Candidates for one removed program. otherLocations are install folders of programs that are
-        /// still installed: anything containing one of them is never offered.
+        /// A strict match, enough to tick a folder: the folder name is the program's name, or shares a whole
+        /// word of 4+ letters with it ("WispFakeApp" ~ "WispFakeApp Test 1.0"); never a shared folder.
         /// </summary>
-        public static List<Leftover> Find(InstalledApp app, List<string> otherLocations)
+        public static bool NamedAfter(string folder, string appName)
+        {
+            if (string.IsNullOrEmpty(folder) || generic.Contains(folder) || shared.Contains(folder)) return false;
+            string clean = CleanName(appName);
+            if (string.Equals(folder, clean, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(folder.Replace(" ", ""), clean.Replace(" ", ""), StringComparison.OrdinalIgnoreCase)) return true;
+            var mine = new HashSet<string>(Words(clean).Where(w => w.Length >= 4 && !generic.Contains(w)), StringComparer.OrdinalIgnoreCase);
+            return Words(folder).Any(w => mine.Contains(w));
+        }
+
+        public static bool IsShared(string folder)
+        {
+            return shared.Contains(folder ?? "") || generic.Contains(folder ?? "");
+        }
+
+        /// <summary>
+        /// Candidates for one removed program. Nothing containing a folder of a program that stays is offered;
+        /// a folder or key under a name another installed program also uses ("Python 3.11" and "Python 3.12"
+        /// both clean to "Python") is listed but not ticked. Data of other users is listed unticked; for a
+        /// program installed for one user only, only that user's profile and registry are looked at.
+        /// </summary>
+        public static List<Leftover> Find(InstalledApp app, Keep keep)
         {
             var found = new List<Leftover>();
             if (app.Kind != AppKind.Win32) return found;
@@ -482,104 +629,108 @@ namespace Wisp
             string clean = CleanName(app.Name);
             if (Usable(clean)) names.Add(clean);
             string loc = app.InstallLocation.TrimEnd('\\');
-            if (loc.Length > 0)
+            if (loc.Length > 0 && loc.IndexOf('%') < 0)
             {
                 string leaf = System.IO.Path.GetFileName(loc);
-                if (Usable(leaf) && !names.Contains(leaf, StringComparer.OrdinalIgnoreCase)) names.Add(leaf);
+                if (Usable(leaf) && !IsShared(leaf) && !names.Contains(leaf, StringComparer.OrdinalIgnoreCase)) names.Add(leaf);
             }
             string pub = CleanPublisher(app.Publisher);
-            if (!Usable(pub)) pub = "";
+            if (!Usable(pub) || IsShared(pub)) pub = "";
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var others = otherLocations.Where(o => o.Length > 3).Select(FileOps.Norm).ToList();
 
-            Action<string> addDir = dir =>
+            // Whose data: the program's own user, or — for a program installed for everyone — the signed-in
+            // user and this account ticked, everyone else's listed unticked.
+            var owner = UserProfiles.BySid(app.UserSid);
+            var profiles = app.UserSid != null ? (owner != null ? new List<UserProfile> { owner } : new List<UserProfile>()) : UserProfiles.All;
+            Func<UserProfile, bool> mine = u => app.UserSid != null || u.IsShell || u.IsSelf;
+
+            Action<string, string, bool, string> addDir = (dir, reason, tick, user) =>
             {
                 try
                 {
                     if (!Directory.Exists(dir) || !FileOps.IsSafeRoot(dir) || !seen.Add(FileOps.Norm(dir))) return;
                     if (!LooksLike(System.IO.Path.GetFileName(dir.TrimEnd('\\')), app.Name, app.Publisher)) return;
-                    string n = FileOps.Norm(dir);
-                    if (others.Any(o => o.StartsWith(n, StringComparison.OrdinalIgnoreCase))) return;
-                    found.Add(new Leftover { Path = dir, Size = FileOps.DirSize(dir), App = app.Name, Checked = true });
-                }
-                catch { }
-            };
-            if (loc.Length > 0) addDir(loc);
-
-            var bases = new[]
-            {
-                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
-                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), @"AppData\LocalLow"),
-            };
-            foreach (string b in bases.Where(x => !string.IsNullOrEmpty(x)).Distinct(StringComparer.OrdinalIgnoreCase))
-                foreach (string n in names)
-                {
-                    addDir(System.IO.Path.Combine(b, n));
-                    if (pub.Length > 0) addDir(System.IO.Path.Combine(b, pub, n));
-                }
-
-            var keys = new List<Tuple<RegistryHive, RegistryView, string>>();
-            foreach (string n in names)
-            {
-                foreach (var hv in new[] { Tuple.Create(RegistryHive.CurrentUser, RegistryView.Registry64), Tuple.Create(RegistryHive.LocalMachine, RegistryView.Registry64), Tuple.Create(RegistryHive.LocalMachine, RegistryView.Registry32) })
-                {
-                    keys.Add(Tuple.Create(hv.Item1, hv.Item2, @"SOFTWARE\" + n));
-                    if (pub.Length > 0) keys.Add(Tuple.Create(hv.Item1, hv.Item2, @"SOFTWARE\" + pub + @"\" + n));
-                }
-            }
-            foreach (var k in keys)
-            {
-                try
-                {
-                    using (var b = RegistryKey.OpenBaseKey(k.Item1, k.Item2))
-                    using (var key = b.OpenSubKey(k.Item3))
+                    if (keep.Contains(dir)) return;
+                    string leaf = System.IO.Path.GetFileName(dir.TrimEnd('\\'));
+                    bool sharedName = keep.Names.Contains(leaf);
+                    found.Add(new Leftover
                     {
-                        if (key == null) continue;
-                        string display = (k.Item1 == RegistryHive.CurrentUser ? "HKCU\\" : "HKLM\\") +
-                            (k.Item2 == RegistryView.Registry32 && k.Item1 == RegistryHive.LocalMachine ? k.Item3.Replace(@"SOFTWARE\", @"SOFTWARE\WOW6432Node\") : k.Item3);
-                        if (!seen.Add(display)) continue;
-                        found.Add(new Leftover { Path = display, IsRegistry = true, Hive = k.Item1, View = k.Item2, SubKey = k.Item3, App = app.Name, Checked = true });
-                    }
+                        Kind = LeftoverKind.Folder, Path = dir, Size = FileOps.DirSize(dir), App = app.Name,
+                        Reason = sharedName ? Leftover.R("Имя есть и у другой программы", "Another program uses this name")
+                               : (user != null ? Leftover.R("Данные пользователя ", "Data of user ") + user : reason),
+                        Checked = tick && !sharedName && !keep.Touches(dir),
+                    });
                 }
                 catch { }
+            };
+            if (loc.Length > 0 && loc.IndexOf('%') < 0)
+                addDir(loc, Leftover.R("Папка программы", "Program folder"), NamedAfter(System.IO.Path.GetFileName(loc), app.Name), null);
+
+            // Program folders and shared data (for programs installed for everyone), then each profile's AppData.
+            if (app.UserSid == null)
+                foreach (string b in new[]
+                {
+                    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+                    Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                }.Where(x => !string.IsNullOrEmpty(x)).Distinct(StringComparer.OrdinalIgnoreCase))
+                    foreach (string n in names)
+                    {
+                        addDir(System.IO.Path.Combine(b, n), Leftover.R("Данные программы", "Program data"), true, null);
+                        if (pub.Length > 0) addDir(System.IO.Path.Combine(b, pub, n), Leftover.R("Данные программы", "Program data"), true, null);
+                    }
+            foreach (var u in profiles)
+                foreach (string b in new[] { u.Roaming, u.Local, System.IO.Path.Combine(u.Dir, @"AppData\LocalLow") })
+                    foreach (string n in names)
+                    {
+                        string user = mine(u) ? null : u.Name;
+                        addDir(System.IO.Path.Combine(b, n), Leftover.R("Данные программы", "Program data"), mine(u), user);
+                        if (pub.Length > 0) addDir(System.IO.Path.Combine(b, pub, n), Leftover.R("Данные программы", "Program data"), mine(u), user);
+                    }
+
+            // Settings in the registry: for everyone (both views) and in the loaded user registries.
+            var roots = new List<Tuple<RegistryHive, RegistryView, string, UserProfile, bool>>();
+            if (app.UserSid == null)
+            {
+                roots.Add(Tuple.Create(RegistryHive.LocalMachine, RegistryView.Registry64, "", (UserProfile)null, true));
+                roots.Add(Tuple.Create(RegistryHive.LocalMachine, RegistryView.Registry32, "", (UserProfile)null, true));
             }
+            foreach (var r in Reg.UserRoots())
+            {
+                if (app.UserSid != null && !string.Equals(r.Sid, app.UserSid, StringComparison.OrdinalIgnoreCase)) continue;
+                var u = UserProfiles.BySid(r.Sid);
+                bool tick = u == null ? app.UserSid != null : mine(u);
+                roots.Add(Tuple.Create(r.Hive, RegistryView.Registry64, r.Prefix, u, tick));
+            }
+            foreach (string n in names)
+                foreach (var r in roots)
+                {
+                    bool tick = r.Item5 && !keep.Names.Contains(n);
+                    string user = r.Item5 || r.Item4 == null ? null : r.Item4.Name;
+                    AddKey(found, seen, app, r.Item1, r.Item2, r.Item3 + @"SOFTWARE\" + n, tick, user);
+                    if (pub.Length > 0) AddKey(found, seen, app, r.Item1, r.Item2, r.Item3 + @"SOFTWARE\" + pub + @"\" + n, tick, user);
+                }
             return found;
         }
 
-        /// <summary>Folders go to the Recycle Bin; registry keys are exported to the backup folder first.</summary>
-        public static int Remove(List<Leftover> items, List<string> errors)
+        static void AddKey(List<Leftover> found, HashSet<string> seen, InstalledApp app, RegistryHive hive, RegistryView view, string sub, bool tick, string user)
         {
-            int done = 0;
-            var dirs = items.Where(i => !i.IsRegistry).ToList();
-            foreach (var d in dirs)
+            try
             {
-                if (!FileOps.IsSafeRoot(d.Path)) continue;
-                if (Native.MoveToRecycleBin(new[] { d.Path }) && !Directory.Exists(d.Path)) done++;
-                else errors.Add(d.Path);
-            }
-            foreach (var r in items.Where(i => i.IsRegistry))
-            {
-                try
+                using (var key = Reg.Open(hive, view, sub))
                 {
-                    Directory.CreateDirectory(Settings.BackupDir);
-                    string file = System.IO.Path.Combine(Settings.BackupDir,
-                        Regex.Replace(r.Path, @"[\\/:*?""<>|]", "_") + "_" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".reg");
-                    string native = (r.Hive == RegistryHive.CurrentUser ? "HKCU\\" : "HKLM\\") + r.SubKey;
-                    var psi = new ProcessStartInfo("reg.exe", "export \"" + native + "\" \"" + file + "\" /y" +
-                        (r.View == RegistryView.Registry32 ? " /reg:32" : " /reg:64"))
-                    { UseShellExecute = false, CreateNoWindow = true };
-                    using (var p = Process.Start(psi)) p.WaitForExit(15000);
-                    using (var b = RegistryKey.OpenBaseKey(r.Hive, r.View))
-                        b.DeleteSubKeyTree(r.SubKey, false);
-                    done++;
+                    if (key == null) return;
+                    string display = Reg.Display(hive, view, sub);
+                    if (!seen.Add(display)) return;
+                    found.Add(new Leftover
+                    {
+                        Kind = LeftoverKind.RegKey, Path = display, Hive = hive, View = view, SubKey = sub, App = app.Name,
+                        Reason = user != null ? Leftover.R("Настройки пользователя ", "Settings of user ") + user : Leftover.R("Настройки в реестре", "Registry settings"),
+                        Checked = tick,
+                    });
                 }
-                catch (Exception ex) { errors.Add(r.Path + ": " + ex.Message); }
             }
-            return done;
+            catch { }
         }
     }
 }

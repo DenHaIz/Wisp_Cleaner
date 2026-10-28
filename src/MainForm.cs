@@ -101,7 +101,7 @@ namespace Wisp
             footer.Height = S(40);
             status.SetBounds(S(18), 0, S(700), footer.Height);
             btnHistory = new FlatButton("", "\uE81C", ButtonKind.Ghost);
-            btnHistory.SetBaseHeight(30);
+            btnHistory.SetBaseHeight(32);
             btnHistory.Click += (s, e) => HistoryForm.ShowFor(this);
             footer.Controls.Add(status);
             footer.Controls.Add(btnHistory);
@@ -149,9 +149,9 @@ namespace Wisp
         void PaintHeader(object sender, PaintEventArgs e)
         {
             var g = e.Graphics;
-            int size = S(32);
-            Logo.Draw(g, new RectangleF(S(18), (header.Height - size) / 2, size, size), true);
-            TextRenderer.DrawText(g, "Wisp Cleaner", Theme.TitleFont, new Rectangle(S(60), 0, titleWidth, header.Height), Theme.Current.Text,
+            int size = S(36);
+            Logo.DrawSharp(g, S(18), (header.Height - size) / 2, size);
+            TextDraw.DrawText(g, "Wisp Cleaner", Theme.TitleFont, new Rectangle(S(64), 0, titleWidth, header.Height), Theme.Current.Text,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
         }
 
@@ -428,8 +428,8 @@ namespace Wisp
 
         void LayoutHeader()
         {
-            titleWidth = TextRenderer.MeasureText("Wisp Cleaner", Theme.TitleFont, Size.Empty, TextFormatFlags.NoPadding).Width + S(4);
-            tabBar.Location = new Point(S(60) + titleWidth + S(28), 0);
+            titleWidth = TextDraw.MeasureText("Wisp Cleaner", Theme.TitleFont, Size.Empty, TextFormatFlags.NoPadding).Width + S(4);
+            tabBar.Location = new Point(S(64) + titleWidth + S(28), 0);
             // Narrow window: the theme switch keeps only its icons so nothing overlaps the tabs.
             bool compact = header.Width < tabBar.Right + S(24) + btnLang.Width + S(8) + themeSwitch.Width + S(16) + (compactTheme ? S(200) : 0);
             if (compact != compactTheme)

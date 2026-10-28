@@ -77,11 +77,28 @@ namespace Wisp
         /// </summary>
         public static bool Delete(string path, string rootFinal)
         {
+            bool inUse;
+            return Delete(path, rootFinal, out inUse);
+        }
+
+        /// <summary>
+        /// As <see cref="Delete(string, string)"/>; inUse is true only when the file was not deleted because
+        /// it is open or running (sharing/lock violation, a mapped program image) and it surely lies inside
+        /// rootFinal — the one case where deleting it at the next restart is right.
+        /// </summary>
+        public static bool Delete(string path, string rootFinal, out bool inUse)
+        {
+            inUse = false;
             if (rootFinal == null) return false;
             using (var h = CreateFile(path, DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, FILE_SHARE_ALL, IntPtr.Zero, OPEN_EXISTING,
                        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero))
             {
-                if (h.IsInvalid) return false;
+                if (h.IsInvalid)
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    if (err == 32 || err == 33) inUse = InsideByParent(path, rootFinal);   // sharing / lock violation
+                    return false;
+                }
                 BY_HANDLE_FILE_INFORMATION info;
                 if (!GetFileInformationByHandle(h, out info) || (info.dwFileAttributes & 0x400) != 0) return false;
                 string real = Final(h);
@@ -98,8 +115,40 @@ namespace Wisp
                     SetFileInformationByHandle(h, FileBasicInfo, ref basic, (uint)Marshal.SizeOf(typeof(FILE_BASIC_INFO)));
                 }
                 uint del = 1;
-                return SetFileInformationByHandle(h, FileDispositionInfo, ref del, 4);
+                if (SetFileInformationByHandle(h, FileDispositionInfo, ref del, 4)) return true;
+                // Opened for deletion and checked, but Windows refuses: a running program's image, mostly.
+                // A folder that is not empty (145) is not "in use".
+                inUse = Marshal.GetLastWin32Error() != 145;
+                return false;
             }
+        }
+
+        /// <summary>The object is no reparse point and its folder's real path lies inside rootFinal.</summary>
+        static bool InsideByParent(string path, string rootFinal)
+        {
+            try
+            {
+                if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0) return false;
+                string parent = FinalPath(Path.GetDirectoryName(path.TrimEnd('\\')));
+                return parent != null && parent.StartsWith(rootFinal, StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
+        /// <summary>True when the path or any folder above it is a junction or symbolic link.</summary>
+        public static bool HasReparsePoint(string path)
+        {
+            try
+            {
+                string p = Path.GetFullPath(path).TrimEnd('\\');
+                while (!string.IsNullOrEmpty(p) && p.Length > 3)
+                {
+                    if ((File.GetAttributes(p) & FileAttributes.ReparsePoint) != 0) return true;
+                    p = Path.GetDirectoryName(p);
+                }
+                return false;
+            }
+            catch { return true; }
         }
 
         // ---------- starting programs without administrator rights ----------
@@ -191,6 +240,89 @@ namespace Wisp
             if (process == IntPtr.Zero) return;
             WaitForSingleObject(process, 0xFFFFFFFF);
             CloseHandle(process);
+        }
+
+        // ---------- who is who ----------
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern bool QueryFullProcessImageName(IntPtr process, int flags, StringBuilder name, ref int size);
+
+        static string selfSid, shellSid;
+        static bool shellKnown;
+
+        /// <summary>The account this app runs as.</summary>
+        public static string SelfSid
+        {
+            get
+            {
+                if (selfSid == null)
+                {
+                    try { selfSid = WindowsIdentity.GetCurrent().User.Value; } catch { selfSid = ""; }
+                }
+                return selfSid;
+            }
+        }
+
+        /// <summary>
+        /// The signed-in user whose desktop this is (owner of Explorer). It differs from SelfSid when
+        /// the UAC prompt was answered with another account's password. Null if Explorer is not running.
+        /// </summary>
+        public static string ShellSid
+        {
+            get
+            {
+                if (!shellKnown)
+                {
+                    int pid;
+                    IntPtr shell = GetShellWindow();
+                    if (shell != IntPtr.Zero && GetWindowThreadProcessId(shell, out pid) != 0) shellSid = OwnerSid(pid);
+                    // Explorer not running (yet): ask again next time instead of remembering "nobody".
+                    shellKnown = shellSid != null;
+                }
+                return shellSid;
+            }
+        }
+
+        /// <summary>SID of the account a process runs as; null when it cannot be read.</summary>
+        public static string OwnerSid(int pid)
+        {
+            IntPtr proc = OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, pid);
+            if (proc == IntPtr.Zero) return null;
+            IntPtr token = IntPtr.Zero;
+            try
+            {
+                if (!OpenProcessToken(proc, 0x0008 /* TOKEN_QUERY */, out token)) return null;
+                using (var id = new WindowsIdentity(token)) return id.User != null ? id.User.Value : null;
+            }
+            catch { return null; }
+            finally
+            {
+                if (token != IntPtr.Zero) CloseHandle(token);
+                CloseHandle(proc);
+            }
+        }
+
+        /// <summary>Full path of a process's executable; null when it cannot be read.</summary>
+        public static string ImagePath(int pid)
+        {
+            IntPtr proc = OpenProcess(0x1000, false, pid);
+            if (proc == IntPtr.Zero) return null;
+            try
+            {
+                var sb = new StringBuilder(1024);
+                int size = sb.Capacity;
+                return QueryFullProcessImageName(proc, 0, sb, ref size) ? sb.ToString(0, size) : null;
+            }
+            finally { CloseHandle(proc); }
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern bool MoveFileEx(string from, string to, int flags);
+
+        /// <summary>Schedules a locked file or an empty folder for deletion at the next restart (administrator only).</summary>
+        public static bool DeleteOnReboot(string path)
+        {
+            return MoveFileEx(path, null, 0x4 /* MOVEFILE_DELAY_UNTIL_REBOOT */);
         }
     }
 }
