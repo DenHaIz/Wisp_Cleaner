@@ -141,6 +141,70 @@ namespace Wisp
                 g.FillPath(b, path);
         }
 
+        /// <summary>
+        /// FillRound for large opaque areas (cards, the drop area): the body as plain rectangles and only the
+        /// four corners anti-aliased. Same picture, but an anti-aliased fill of a whole card cost ~8 ms a paint
+        /// at 150 %; this is well under one.
+        /// </summary>
+        public static void FillRoundFast(Graphics g, Color color, RectangleF r, float radius)
+        {
+            float d = Math.Min(radius * 2, Math.Min(r.Width, r.Height));
+            if (color.A < 255 || d <= 1 || r.Width * r.Height < 20000)
+            {
+                FillRound(g, color, r, radius);
+                return;
+            }
+            var mode = g.SmoothingMode;
+            float k = d / 2;
+            using (var b = new SolidBrush(color))
+            {
+                // Overlapping by a pixel: the same opaque colour, so no seams where the parts meet.
+                g.SmoothingMode = SmoothingMode.None;
+                g.FillRectangle(b, r.X + k - 1, r.Y, r.Width - d + 2, r.Height);
+                g.FillRectangle(b, r.X, r.Y + k - 1, r.Width, r.Height - d + 2);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.FillPie(b, r.X, r.Y, d, d, 180, 90);
+                g.FillPie(b, r.Right - d, r.Y, d, d, 270, 90);
+                g.FillPie(b, r.Right - d, r.Bottom - d, d, d, 0, 90);
+                g.FillPie(b, r.X, r.Bottom - d, d, d, 90, 90);
+            }
+            g.SmoothingMode = mode;
+        }
+
+        /// <summary>
+        /// A 1 px rounded outline on a half-pixel rectangle (as cards draw it): straight sides as pixel rows and
+        /// columns, only the corner arcs anti-aliased. Looks the same as DrawRound, far less work for big cards.
+        /// </summary>
+        public static void DrawRoundFast(Graphics g, Color color, RectangleF r, float radius)
+        {
+            float d = Math.Min(radius * 2, Math.Min(r.Width, r.Height));
+            if (d <= 1 || r.Width < 40 || r.Height < 40)
+            {
+                DrawRound(g, color, r, radius);
+                return;
+            }
+            var mode = g.SmoothingMode;
+            int x0 = (int)Math.Floor(r.X), y0 = (int)Math.Floor(r.Y), x1 = (int)Math.Floor(r.Right), y1 = (int)Math.Floor(r.Bottom);
+            int k = (int)Math.Ceiling(d / 2);
+            g.SmoothingMode = SmoothingMode.None;
+            using (var b = new SolidBrush(color))
+            {
+                g.FillRectangle(b, x0 + k, y0, x1 - x0 - 2 * k + 1, 1);
+                g.FillRectangle(b, x0 + k, y1, x1 - x0 - 2 * k + 1, 1);
+                g.FillRectangle(b, x0, y0 + k, 1, y1 - y0 - 2 * k + 1);
+                g.FillRectangle(b, x1, y0 + k, 1, y1 - y0 - 2 * k + 1);
+            }
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var pen = new Pen(color))
+            {
+                g.DrawArc(pen, r.X, r.Y, d, d, 180, 90);
+                g.DrawArc(pen, r.Right - d, r.Y, d, d, 270, 90);
+                g.DrawArc(pen, r.Right - d, r.Bottom - d, d, d, 0, 90);
+                g.DrawArc(pen, r.X, r.Bottom - d, d, d, 90, 90);
+            }
+            g.SmoothingMode = mode;
+        }
+
         public static void DrawRound(Graphics g, Color color, RectangleF r, float radius)
         {
             using (var path = RoundRect(r, radius))

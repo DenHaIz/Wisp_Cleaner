@@ -8,22 +8,27 @@ using Microsoft.Win32;
 
 namespace Wisp
 {
-    /// <summary>A user's part of the registry: HKCU for this account, HKEY_USERS\SID for other signed-in users.</summary>
+    /// <summary>
+    /// A user's part of the registry: HKCU for this account, HKEY_USERS\SID for other signed-in users and
+    /// HKEY_USERS\WispUser_SID for users who are not signed in (loaded for a while by <see cref="UserHives"/>).
+    /// </summary>
     class UserRoot
     {
         public RegistryHive Hive;
         public string Prefix = "";      // prepended to "Software\..." paths
         public string Sid;
+        public bool Offline;            // a signed-out user's registry, loaded only for a while
+        public string Classes;          // where their Software\Classes is, when not in the usual place
 
         /// <summary>Where this user's Software\Classes lives (a separate hive under HKEY_USERS).</summary>
-        public string ClassesPrefix { get { return Hive == RegistryHive.Users ? Sid + @"_Classes\" : @"Software\Classes\"; } }
+        public string ClassesPrefix { get { return Classes ?? (Hive == RegistryHive.Users ? Sid + @"_Classes\" : @"Software\Classes\"); } }
     }
 
     static class Reg
     {
         /// <summary>
         /// This account's HKCU and — as administrator — the registry of every other user who is signed in
-        /// (loaded under HKEY_USERS). Signed-out users' registry is a closed file and is not touched.
+        /// (loaded under HKEY_USERS), plus that of signed-out users while <see cref="UserHives"/> has it loaded.
         /// </summary>
         public static List<UserRoot> UserRoots()
         {
@@ -39,6 +44,7 @@ namespace Wisp
                 }
             }
             catch { }
+            list.AddRange(UserHives.Roots());
             return list;
         }
 
@@ -78,6 +84,9 @@ namespace Wisp
         /// <summary>"HKLM\SOFTWARE\WOW6432Node\..." — as the key is shown to the user.</summary>
         public static string Display(RegistryHive hive, RegistryView view, string sub)
         {
+            // A signed-out user's registry is shown under the SID, as it is when they are signed in.
+            if (hive == RegistryHive.Users && sub.StartsWith(UserHives.MountPrefix, StringComparison.OrdinalIgnoreCase))
+                sub = sub.Substring(UserHives.MountPrefix.Length);
             return Short(hive) + "\\" + Real(hive, view, sub);
         }
 
@@ -254,6 +263,11 @@ namespace Wisp
         const string AppPaths = @"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths";
 
         public static List<Leftover> Scan(Func<bool> cancel)
+        {
+            using (UserHives.LoadAll()) return ScanNow(cancel);
+        }
+
+        static List<Leftover> ScanNow(Func<bool> cancel)
         {
             var found = new List<Leftover>();
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);

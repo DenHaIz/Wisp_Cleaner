@@ -41,13 +41,20 @@ namespace Wisp
         public bool IsMsi;
         public string UserSid;           // per-user entry: whose (null for programs installed for everyone)
         public bool Broken;              // the uninstaller is gone: only forced removal helps
+        public string ProductCode;       // Windows Installer product {GUID}, or null
+        public bool Hidden;              // a system component or an entry without an uninstaller: Windows does not list it
+
+        // Removed not completely: still on the disk, but without an entry in the programs list
+        public bool Orphan;
+        public string Evidence = "";     // why it is listed: what of it still runs or is there
+        public string BackupReg;         // the entry Wisp Cleaner removed earlier (.reg) — it can be brought back
 
         // Store
         public string PackageFullName = "", PackageFamilyName = "";
 
         public RowKind RowKind { get { return Failed ? RowKind.Danger : RowKind.Normal; } }
         public string IconPath { get { return Icon; } }
-        public int Dot { get { return Broken && !Failed ? 3 : 0; } }
+        public int Dot { get { return (Broken || Orphan) && !Failed ? 3 : 0; } }
 
         public UserProfile User { get { return UserProfiles.BySid(UserSid); } }
 
@@ -55,9 +62,12 @@ namespace Wisp
         {
             get
             {
-                if (Kind == AppKind.Store) return "Microsoft Store";
                 var u = User;
-                return L.T("Классическая", "Desktop") + (u != null && UserProfiles.Many ? " · " + u.Name : "");
+                string who = u != null && UserProfiles.Many ? " · " + u.Name : "";
+                if (Kind == AppKind.Store) return "Microsoft Store" + who;
+                if (Orphan) return L.T("Без записи", "No entry") + who;
+                if (Hidden) return L.T("Компонент", "Component") + who;
+                return L.T("Классическая", "Desktop") + who;
             }
         }
 
@@ -72,7 +82,7 @@ namespace Wisp
             get
             {
                 if (Kind == AppKind.Store) return true;
-                if (Broken) return false;
+                if (Broken || Orphan) return false;
                 return UserSid == null || string.Equals(UserSid, Secure.ShellSid, StringComparison.OrdinalIgnoreCase) ||
                        string.Equals(UserSid, Secure.SelfSid, StringComparison.OrdinalIgnoreCase);
             }
@@ -81,11 +91,17 @@ namespace Wisp
         /// <summary>The uninstall entry as shown in regedit (WOW6432Node for 32-bit entries).</summary>
         public string RegistryPath { get { return Reg.Display(Hive, View, KeyPath + "\\" + KeyName); } }
 
+        /// <summary>The entry is in the registry of a user who is not signed in (HKEY_USERS\WispUser_SID).</summary>
+        public bool Offline { get { return Hive == RegistryHive.Users && KeyPath.StartsWith(UserHives.MountPrefix, StringComparison.OrdinalIgnoreCase); } }
+
         public bool StillInstalled()
         {
-            if (Kind == AppKind.Store) return StoreApps.IsInstalled(PackageFullName);
+            if (Kind == AppKind.Store) return StoreApps.IsInstalled(PackageFullName, UserSid);
+            if (Orphan) return Directory.Exists(InstallLocation);
             try
             {
+                // A signed-out user's entry: their registry is loaded for the look.
+                using (Offline ? UserHives.Load(new[] { UserSid }) : null)
                 using (var b = RegistryKey.OpenBaseKey(Hive, View))
                 using (var k = b.OpenSubKey(KeyPath + "\\" + KeyName))
                     return k != null;
@@ -107,8 +123,13 @@ namespace Wisp
         /// </summary>
         public static List<InstalledApp> Load()
         {
+            // Users who are not signed in too: their registry is loaded while it is read.
+            using (UserHives.LoadAll()) return LoadNow();
+        }
+
+        static List<InstalledApp> LoadNow()
+        {
             var list = new List<InstalledApp>();
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var sources = new List<Tuple<RegistryHive, RegistryView, string, string>>
             {
                 Tuple.Create(RegistryHive.LocalMachine, RegistryView.Registry64, "", (string)null),
@@ -116,6 +137,16 @@ namespace Wisp
             };
             foreach (var u in Reg.UserRoots())
                 sources.Add(Tuple.Create(u.Hive, RegistryView.Registry64, u.Prefix, u.Sid));
+            var byKey = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            Action<InstalledApp, string> add = (app, sid) =>
+            {
+                // The same program in both views or for everyone and this account is listed once; other users' own
+                // copies are listed separately. A hidden component named like a visible program (the part a setup
+                // bundle installs) stays too: it knows where the program lives.
+                bool own = sid == null || string.Equals(sid, Secure.SelfSid, StringComparison.OrdinalIgnoreCase);
+                string key = app.Name + "|" + app.Version + (own ? "" : "|" + sid) + (app.Hidden ? "|hidden" : "");
+                if (!byKey.ContainsKey(key)) { byKey[key] = list.Count; list.Add(app); }
+            };
             foreach (var src in sources)
             {
                 try
@@ -130,14 +161,10 @@ namespace Wisp
                             {
                                 using (var k = root.OpenSubKey(name))
                                 {
-                                    var app = Read(k, name, src.Item1, src.Item2, src.Item4);
+                                    var app = Read(k, name, Guid.IsMatch(name) ? name : null, src.Item1, src.Item2, src.Item4);
                                     if (app == null) continue;
                                     app.KeyPath = src.Item3 + UninstallPath;
-                                    app.UserSid = src.Item4;
-                                    // The same program in both views or for everyone and this account is listed once;
-                                    // other users' own copies are listed separately.
-                                    bool own = src.Item4 == null || string.Equals(src.Item4, Secure.SelfSid, StringComparison.OrdinalIgnoreCase);
-                                    if (seen.Add(app.Name + "|" + app.Version + (own ? "" : "|" + src.Item4))) list.Add(app);
+                                    add(app, src.Item4);
                                 }
                             }
                             catch { }
@@ -146,7 +173,62 @@ namespace Wisp
                 }
                 catch { }
             }
+            PerUserMsi(add);
             return list;
+        }
+
+        const string UserData = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData";
+
+        /// <summary>
+        /// Windows Installer packages installed "just for me": their entry is not under Uninstall at all, only in
+        /// the installer's own data for that user (Windows' list reads it from there).
+        /// </summary>
+        static void PerUserMsi(Action<InstalledApp, string> add)
+        {
+            try
+            {
+                using (var ud = Reg.Open(RegistryHive.LocalMachine, RegistryView.Registry64, UserData))
+                {
+                    if (ud == null) return;
+                    foreach (string sid in ud.GetSubKeyNames())
+                    {
+                        if (!sid.StartsWith("S-1-5-21-", StringComparison.OrdinalIgnoreCase)) continue;   // S-1-5-18: for everyone, listed above
+                        string products = UserData + "\\" + sid + @"\Products";
+                        using (var root = Reg.Open(RegistryHive.LocalMachine, RegistryView.Registry64, products))
+                        {
+                            if (root == null) continue;
+                            foreach (string packed in root.GetSubKeyNames())
+                            {
+                                try
+                                {
+                                    using (var k = root.OpenSubKey(packed + @"\InstallProperties"))
+                                    {
+                                        string code = Unpack(packed);
+                                        var app = Read(k, packed, code, RegistryHive.LocalMachine, RegistryView.Registry64, sid);
+                                        if (app == null) continue;
+                                        app.KeyPath = products;      // the whole registration is the entry
+                                        app.IsMsi = code != null;
+                                        add(app, sid);
+                                    }
+                                }
+                                catch { }
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>The installer's "packed" key name back to {GUID} (the same swaps undo themselves); null if it is not one.</summary>
+        public static string Unpack(string p)
+        {
+            if (p == null || p.Length != 32 || !Regex.IsMatch(p, "^[0-9A-Fa-f]{32}$")) return null;
+            Func<string, string> rev = s => new string(s.Reverse().ToArray());
+            var sb = new StringBuilder(rev(p.Substring(0, 8)) + rev(p.Substring(8, 4)) + rev(p.Substring(12, 4)));
+            for (int i = 16; i < 32; i += 2) sb.Append(p[i + 1]).Append(p[i]);
+            string g = sb.ToString().ToUpperInvariant();
+            return "{" + g.Substring(0, 8) + "-" + g.Substring(8, 4) + "-" + g.Substring(12, 4) + "-" + g.Substring(16, 4) + "-" + g.Substring(20) + "}";
         }
 
         [System.Runtime.InteropServices.DllImport("msi.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
@@ -160,8 +242,9 @@ namespace Wisp
         {
             if (app.IsMsi)
             {
-                if (app.Hive != RegistryHive.LocalMachine) return false;
-                try { return MsiQueryProductState(app.KeyName) == -1; } // INSTALLSTATE_UNKNOWN
+                // Per-user installs are known to the installer only in their user's own context.
+                if (app.Hive != RegistryHive.LocalMachine || app.UserSid != null) return false;
+                try { return MsiQueryProductState(app.ProductCode) == -1; } // INSTALLSTATE_UNKNOWN
                 catch { return false; }
             }
             string cmd = app.QuietUninstallString.Length > 0 ? app.QuietUninstallString : app.UninstallString;
@@ -176,25 +259,29 @@ namespace Wisp
             return v is string ? UserProfiles.Expand(((string)v).Trim(), sid).Trim() : v.ToString().Trim();
         }
 
-        static InstalledApp Read(RegistryKey k, string keyName, RegistryHive hive, RegistryView view, string sid)
+        /// <summary>
+        /// One entry. Updates are skipped; system components (parts of another program's installation) and
+        /// entries without any uninstaller — Windows does not list either — come back as Hidden.
+        /// </summary>
+        static InstalledApp Read(RegistryKey k, string keyName, string productCode, RegistryHive hive, RegistryView view, string sid)
         {
             if (k == null) return null;
             Func<RegistryKey, string, string> Str = (key, value) => Win32Apps.Str(key, value, sid);
             string name = Str(k, "DisplayName");
             if (name.Length == 0) return null;
-            if (Str(k, "SystemComponent") == "1" || Str(k, "ParentKeyName").Length > 0) return null;
+            if (Str(k, "ParentKeyName").Length > 0) return null;
             string release = Str(k, "ReleaseType");
             if (release.IndexOf("Update", StringComparison.OrdinalIgnoreCase) >= 0 || release.IndexOf("Hotfix", StringComparison.OrdinalIgnoreCase) >= 0) return null;
             if (KbName.IsMatch(keyName)) return null;
             string uninstall = Str(k, "UninstallString"), quiet = Str(k, "QuietUninstallString");
-            bool msi = Str(k, "WindowsInstaller") == "1" && Guid.IsMatch(keyName);
-            if (uninstall.Length == 0 && quiet.Length == 0 && !msi) return null;
+            bool msi = Str(k, "WindowsInstaller") == "1" && productCode != null;
+            bool hidden = Str(k, "SystemComponent") == "1" || uninstall.Length == 0 && quiet.Length == 0 && !msi;
 
             var app = new InstalledApp
             {
                 Kind = AppKind.Win32, Name = name, Publisher = Str(k, "Publisher"), Version = Str(k, "DisplayVersion"),
-                Hive = hive, View = view, KeyPath = UninstallPath, KeyName = keyName,
-                UninstallString = uninstall, QuietUninstallString = quiet, IsMsi = msi, UserSid = sid,
+                Hive = hive, View = view, KeyPath = UninstallPath, KeyName = keyName, ProductCode = productCode,
+                UninstallString = uninstall, QuietUninstallString = quiet, IsMsi = msi, UserSid = sid, Hidden = hidden,
                 InstallLocation = Str(k, "InstallLocation").Trim('"'),
             };
             object est = k.GetValue("EstimatedSize");
@@ -208,7 +295,7 @@ namespace Wisp
                 if (exe.Length > 0 && !Path.GetFileName(exe).Equals("msiexec.exe", StringComparison.OrdinalIgnoreCase)) icon = exe;
             }
             app.Icon = icon.Length > 0 ? icon : null;
-            app.Broken = IsBroken(app);
+            app.Broken = uninstall.Length == 0 && quiet.Length == 0 && !msi || IsBroken(app);
             return app;
         }
 
@@ -270,7 +357,7 @@ namespace Wisp
             if (app.IsMsi)
             {
                 exe = "msiexec.exe";
-                args = "/x " + app.KeyName + " /qn /norestart";
+                args = "/x " + app.ProductCode + " /qn /norestart";
             }
             else if (app.QuietUninstallString.Length > 0)
             {
@@ -347,27 +434,49 @@ namespace Wisp
     /// <summary>Microsoft Store (packaged) apps of the current user, via PowerShell's Appx module.</summary>
     static class StoreApps
     {
+        /// <summary>
+        /// The apps of this account; as administrator, those of every user of the PC (Get-AppxPackage -AllUsers
+        /// with each package's users), one row per user who has the app — on a shared PC an administrator sees
+        /// and removes the apps of people who are not signed in, too.
+        /// </summary>
         public static List<InstalledApp> Load()
         {
             var list = new List<InstalledApp>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            bool all = Secure.IsElevated;
+            string filter = " | Where-Object { -not $_.IsFramework -and -not $_.NonRemovable -and $_.SignatureKind -ne 'System' } | ";
+            string fields = "$_.Name + \"`t\" + $_.PackageFullName + \"`t\" + $_.PackageFamilyName + \"`t\" + $_.InstallLocation + \"`t\" + $_.Version";
             string script =
                 "$ErrorActionPreference='SilentlyContinue';" +
                 "[Console]::OutputEncoding=[Text.Encoding]::UTF8;" +
-                "Get-AppxPackage -PackageTypeFilter Main | Where-Object { -not $_.IsFramework -and -not $_.NonRemovable -and $_.SignatureKind -ne 'System' } | " +
-                "ForEach-Object { $_.Name + \"`t\" + $_.PackageFullName + \"`t\" + $_.PackageFamilyName + \"`t\" + $_.InstallLocation + \"`t\" + $_.Version }";
-            string output = PowerShell(script, 60000);
+                (all
+                    ? "Get-AppxPackage -AllUsers -PackageTypeFilter Main" + filter +
+                      "ForEach-Object { $line = " + fields + "; foreach ($u in $_.PackageUserInformation) { " +
+                      "if (\"$($u.InstallState)\" -eq 'Installed') { $line + \"`t\" + $u.UserSecurityId.Sid } } }"
+                    : "Get-AppxPackage -PackageTypeFilter Main" + filter + "ForEach-Object { " + fields + " }");
+            string output = PowerShell(script, 120000);
             foreach (string line in output.Split('\n'))
             {
                 var parts = line.TrimEnd('\r').Split('\t');
                 if (parts.Length < 5 || parts[3].Length == 0) continue;
+                string sid = parts.Length > 5 ? parts[5].Trim() : null;
+                if (all && (sid == null || !(sid.StartsWith("S-1-5-21-") || sid.StartsWith("S-1-12-1-")))) continue;   // real accounts only
+                if (string.Equals(sid, Secure.SelfSid, StringComparison.OrdinalIgnoreCase)) sid = null;
+                if (!seen.Add(parts[1] + "|" + sid)) continue;
                 var app = new InstalledApp
                 {
                     Kind = AppKind.Store, Name = parts[0], PackageFullName = parts[1], PackageFamilyName = parts[2],
-                    InstallLocation = parts[3], Version = parts[4],
+                    InstallLocation = parts[3], Version = parts[4], UserSid = sid,
                 };
                 if (ReadManifest(app)) list.Add(app);
             }
             return list;
+        }
+
+        /// <summary>" -User 'S-1-5-…'" for another user's packages (administrator only), empty for this account's.</summary>
+        static string UserArg(string sid)
+        {
+            return sid == null || !Regex.IsMatch(sid, @"^S-1-[0-9\-]+$") ? "" : " -User '" + sid + "'";
         }
 
         /// <summary>Display name, publisher and logo from AppxManifest.xml; false for packages without a Start menu entry.</summary>
@@ -458,17 +567,17 @@ namespace Wisp
             catch { return null; }
         }
 
-        public static bool IsInstalled(string fullName)
+        public static bool IsInstalled(string fullName, string sid)
         {
-            string output = PowerShell("$ErrorActionPreference='SilentlyContinue'; if (Get-AppxPackage | Where-Object { $_.PackageFullName -eq '" +
+            string output = PowerShell("$ErrorActionPreference='SilentlyContinue'; if (Get-AppxPackage" + UserArg(sid) + " | Where-Object { $_.PackageFullName -eq '" +
                 fullName.Replace("'", "''") + "' }) { 'yes' }", 30000);
             return output.Trim() == "yes";
         }
 
         public static bool Uninstall(InstalledApp app)
         {
-            PowerShell("Remove-AppxPackage -Package '" + app.PackageFullName.Replace("'", "''") + "'", 5 * 60000);
-            return !IsInstalled(app.PackageFullName);
+            PowerShell("Remove-AppxPackage -Package '" + app.PackageFullName.Replace("'", "''") + "'" + UserArg(app.UserSid), 5 * 60000);
+            return !IsInstalled(app.PackageFullName, app.UserSid);
         }
 
         static string PowerShell(string script, int timeoutMs)

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
@@ -323,6 +324,96 @@ namespace Wisp
         public static bool DeleteOnReboot(string path)
         {
             return MoveFileEx(path, null, 0x4 /* MOVEFILE_DELAY_UNTIL_REBOOT */);
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetProcessInformation(IntPtr process, int cls, out uint info, uint size);
+
+        /// <summary>
+        /// True for a protected process (antivirus self-defense, system services): Windows does not let even
+        /// an administrator end it or touch its files.
+        /// </summary>
+        public static bool IsProtectedProcess(int pid)
+        {
+            IntPtr proc = OpenProcess(0x1000, false, pid);
+            if (proc == IntPtr.Zero) return false;
+            try
+            {
+                uint level;
+                // ProcessProtectionLevelInfo (Windows 8+); PROTECTION_LEVEL_NONE = 0xFFFFFFFE
+                return GetProcessInformation(proc, 7, out level, 4) && level != 0xFFFFFFFE;
+            }
+            catch (EntryPointNotFoundException) { return false; }
+            finally { CloseHandle(proc); }
+        }
+
+        // ---------- Restart Manager: who holds a file ----------
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct RM_UNIQUE_PROCESS
+        {
+            public int dwProcessId;
+            public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct RM_PROCESS_INFO
+        {
+            public RM_UNIQUE_PROCESS Process;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string strAppName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string strServiceShortName;
+            public int ApplicationType;
+            public uint AppStatus;
+            public uint TSSessionId;
+            [MarshalAs(UnmanagedType.Bool)] public bool bRestartable;
+        }
+
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+        static extern int RmStartSession(out uint session, int flags, StringBuilder key);
+        [DllImport("rstrtmgr.dll")]
+        static extern int RmEndSession(uint session);
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+        static extern int RmRegisterResources(uint session, uint nFiles, string[] files, uint nApps, IntPtr apps, uint nServices, string[] services);
+        [DllImport("rstrtmgr.dll")]
+        static extern int RmGetList(uint session, out uint needed, ref uint count, [In, Out] RM_PROCESS_INFO[] info, ref uint reasons);
+
+        /// <summary>
+        /// The programs that have the file open or loaded, as "name.exe" (empty when nobody does — then a
+        /// refusal to delete it is a protection, not "in use").
+        /// </summary>
+        public static List<string> LockedBy(string path)
+        {
+            var result = new List<string>();
+            uint session;
+            try
+            {
+                if (RmStartSession(out session, 0, new StringBuilder(64)) != 0) return result;
+            }
+            catch { return result; }
+            try
+            {
+                if (RmRegisterResources(session, 1, new[] { path }, 0, IntPtr.Zero, 0, null) != 0) return result;
+                uint needed, count = 0, reasons = 0;
+                int rc = RmGetList(session, out needed, ref count, null, ref reasons);
+                if (rc != 234 /* ERROR_MORE_DATA */ || needed == 0) return result;
+                var info = new RM_PROCESS_INFO[needed];
+                count = needed;
+                if (RmGetList(session, out needed, ref count, info, ref reasons) != 0) return result;
+                for (int i = 0; i < count; i++)
+                {
+                    string name = null;
+                    try
+                    {
+                        string img = ImagePath(info[i].Process.dwProcessId);
+                        name = img != null ? Path.GetFileName(img) : info[i].strAppName;
+                    }
+                    catch { }
+                    if (!string.IsNullOrEmpty(name) && !result.Contains(name)) result.Add(name);
+                }
+            }
+            catch { }
+            finally { RmEndSession(session); }
+            return result;
         }
     }
 }

@@ -20,7 +20,8 @@ namespace Wisp
         readonly System.Windows.Forms.Timer searchDebounce = new System.Windows.Forms.Timer { Interval = 200 };
         readonly ToolTip tip = new ToolTip();
         readonly ContextMenuStrip menu = new ContextMenuStrip();
-        ToolStripMenuItem miUninstall, miForce, miEntry, miFolder, miRegistry, miSearch, miCopy;
+        ToolStripMenuItem miUninstall, miForce, miRestore, miEntry, miFolder, miRegistry, miSearch, miCopy, miRefresh;
+        ToolStripSeparator menuLine;
 
         List<InstalledApp> apps = new List<InstalledApp>();
         bool loading, storeLoading, uninstalling, stopRequested, loaded;
@@ -29,7 +30,7 @@ namespace Wisp
         {
             toolbar.Dock = DockStyle.Top;
             toolbar.Height = S(60);
-            filter = new Segmented(new[] { "", "", "" }, new[] { "", "", "" }, 0);
+            filter = new Segmented(new[] { "", "", "", "" }, new[] { "", "", "", "" }, 0);
             filter.SelectedIndexChanged += (s, e) => Transition.CrossFade(listHost, Render, 200);
             btnUninstall = Button("\uE74D", ButtonKind.Danger);
             btnUninstall.Click += (s, e) => DoUninstall(Checked());
@@ -91,7 +92,9 @@ namespace Wisp
 
         public override void ApplyLanguage()
         {
-            filter.SetTexts(new[] { L.T("Все", "All"), L.T("Классические", "Desktop"), "Microsoft Store" });
+            filter.SetTexts(new[] { L.T("Все", "All"), L.T("Классические", "Desktop"), "Microsoft Store", L.T("Скрытые", "Hidden") });
+            tip.SetToolTip(filter, L.T("Скрытые — системные компоненты и записи без деинсталлятора: Windows их не показывает",
+                "Hidden: system components and entries without an uninstaller, which Windows does not show"));
             SetButton(btnStop, L.T("Остановить", "Stop"));
             search.SetCue(L.T("Поиск программ", "Search programs"));
             tip.SetToolTip(btnUninstall, L.T("Где возможно — тихо, без окон. Иначе откроется мастер удаления самой программы",
@@ -102,6 +105,8 @@ namespace Wisp
                 "Find registry entries that point at deleted files"));
             miUninstall.Text = L.T("Удалить", "Uninstall");
             miForce.Text = L.T("Принудительное удаление…", "Force uninstall…");
+            miRestore.Text = L.T("Вернуть запись в список программ", "Bring the entry back to the programs list");
+            miRefresh.Text = L.T("Обновить список", "Refresh the list");
             miEntry.Text = L.T("Убрать только запись из списка", "Remove the list entry only");
             miFolder.Text = L.T("Открыть папку программы", "Open the program folder");
             miRegistry.Text = L.T("Показать в редакторе реестра", "Show in Registry Editor");
@@ -160,7 +165,21 @@ namespace Wisp
 
         public override void FocusSearch() { search.FocusBox(); }
 
-        protected override void FirstActivate() { Load(); }
+        protected override void FirstActivate()
+        {
+            Load();
+            // Files queued for deletion at the restart: after one, what is still there is reported.
+            var th = new Thread(() =>
+            {
+                var left = PendingCheck.StillThere();
+                if (left.Count == 0) return;
+                Post(() => ThemedDialog.Info(Host.Window, L.T("После перезагрузки удалилось не всё", "Not everything went at the restart"),
+                    L.T("Эти файлы должны были удалиться при перезагрузке, но остались на месте (их защищает другая программа или Windows):\n\n",
+                        "These files were to go at the restart but are still there (another program or Windows protects them):\n\n") +
+                    string.Join("\n", left.Take(15)) + (left.Count > 15 ? "\n…" : ""), true));
+            }) { IsBackground = true };
+            th.Start();
+        }
 
         public override void RefreshData()
         {
@@ -179,7 +198,13 @@ namespace Wisp
             var th = new Thread(() =>
             {
                 var win32 = new List<InstalledApp>();
-                try { win32 = Win32Apps.Load(); } catch { }
+                // Signed-out users' registry is loaded once for both reads.
+                using (UserHives.LoadAll())
+                {
+                    try { win32 = Win32Apps.Load(); } catch { }
+                    // Programs removed not completely (no entry, but still on the disk) are listed with the rest.
+                    try { win32.AddRange(OrphanApps.Find(win32)); } catch { }
+                }
                 var newIcons = new Dictionary<string, Bitmap>(StringComparer.OrdinalIgnoreCase);
                 foreach (var a in win32)
                 {
@@ -240,12 +265,15 @@ namespace Wisp
 
         static string TickKey(InstalledApp a)
         {
-            return a.Kind == AppKind.Store ? "store|" + a.PackageFullName : a.Hive + "|" + a.View + "|" + a.KeyPath + "\\" + a.KeyName;
+            if (a.Kind == AppKind.Store) return "store|" + a.PackageFullName + "|" + a.UserSid;
+            if (a.Orphan) return "orphan|" + a.InstallLocation;
+            return a.Hive + "|" + a.View + "|" + a.KeyPath + "\\" + a.KeyName;
         }
 
         static string RowStatus(InstalledApp a)
         {
             if (a.StatusText.Length > 0) return a.StatusText;
+            if (a.Orphan) return a.Evidence;
             if (a.Broken) return L.T("Деинсталлятор не найден", "Uninstaller is missing");
             if (!a.CanRunUninstaller) return L.T("Только принудительно", "Force uninstall only");
             return a.CanQuiet ? L.T("Тихое удаление", "Silent removal") : L.T("Мастер удаления", "Uninstall wizard");
@@ -267,6 +295,7 @@ namespace Wisp
             var rows = new List<ListViewItem>();
             foreach (var a in apps)
             {
+                if (f == 3 ? !a.Hidden : a.Hidden) continue;
                 if (f == 1 && a.Kind != AppKind.Win32) continue;
                 if (f == 2 && a.Kind != AppKind.Store) continue;
                 if (q.Length > 0 && a.Name.IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0 &&
@@ -284,6 +313,7 @@ namespace Wisp
             lv.EmptyGlyph = q.Length > 0 ? "\uE721" : "\uE71D";
             if (q.Length > 0) lv.EmptyText = L.T("Ничего не найдено по запросу ", "Nothing matches ") + L.Quote(q);
             else if (f == 2 && storeLoading) lv.EmptyText = L.T("Загрузка приложений Microsoft Store…", "Loading Microsoft Store apps…");
+            else if (f == 3) lv.EmptyText = L.T("Скрытых записей нет", "No hidden entries");
             else lv.EmptyText = L.T("Программ нет", "No programs");
             Host.UpdateStatus();
         }
@@ -335,10 +365,18 @@ namespace Wisp
             {
                 if (!loaded) return L.T("Загрузка…", "Loading…");
                 var sel = Checked();
+                var shown = apps.Where(a => !a.Hidden).ToList();
                 string s = string.Format(L.T("Программ: {0}  ·  классических: {1}  ·  из Microsoft Store: {2}", "Programs: {0}  ·  desktop: {1}  ·  Microsoft Store: {2}"),
-                    apps.Count, apps.Count(a => a.Kind == AppKind.Win32), storeLoading ? "…" : apps.Count(a => a.Kind == AppKind.Store).ToString());
-                int broken = apps.Count(a => a.Broken);
+                    shown.Count, shown.Count(a => a.Kind == AppKind.Win32), storeLoading ? "…" : shown.Count(a => a.Kind == AppKind.Store).ToString());
+                int orphans = shown.Count(a => a.Orphan);
+                if (orphans > 0) s += string.Format(L.T("  ·  удалены не до конца: {0}", "  ·  removed not completely: {0}"), orphans);
+                int broken = shown.Count(a => a.Broken);
                 if (broken > 0) s += string.Format(L.T("  ·  без деинсталлятора: {0}", "  ·  without uninstaller: {0}"), broken);
+                int hidden = apps.Count(a => a.Hidden);
+                if (hidden > 0) s += string.Format(L.T("  ·  скрытых: {0}", "  ·  hidden: {0}"), hidden);
+                if (UserProfiles.Many) s += string.Format(L.T("  ·  пользователей: {0}", "  ·  users: {0}"), UserProfiles.All.Count);
+                var unread = UserHives.Failed;
+                if (unread.Count > 0) s += L.T("  ·  реестр не открылся: ", "  ·  registry not readable: ") + string.Join(", ", unread.Take(3)) + (unread.Count > 3 ? "…" : "");
                 if (sel.Count > 0)
                     s += string.Format(L.T("  ·  отмечено: {0} ({1})", "  ·  ticked: {0} ({1})"), sel.Count, L.Size(sel.Where(a => a.Size > 0).Sum(a => a.Size)));
                 return s;
@@ -387,6 +425,7 @@ namespace Wisp
             };
             miUninstall = item("\uE74D", true, (s, e) => DoUninstall(MenuTargets()));
             miForce = item("\uE945", true, (s, e) => DoForce(MenuTargets()));
+            miRestore = item("\uE7A7", false, (s, e) => RestoreEntry(FocusedApp()));
             miEntry = item("\uE894", false, (s, e) => RemoveEntry(FocusedApp()));
             menu.Items.Add(new ToolStripSeparator());
             miFolder = item("\uE838", false, (s, e) => OpenLocation(FocusedApp()));
@@ -408,6 +447,9 @@ namespace Wisp
             {
                 try { Clipboard.SetText(FocusedApp().Name); } catch { }
             });
+            menuLine = new ToolStripSeparator();
+            menu.Items.Add(menuLine);
+            miRefresh = item("\uE72C", false, (s, e) => RefreshData());
         }
 
         /// <summary>The ticked programs when the clicked one is among them, otherwise just the clicked one.</summary>
@@ -422,26 +464,35 @@ namespace Wisp
         bool PrepareMenu()
         {
             var at = lv.PointToClient(MousePosition);
-            var hit = lv.ClientRectangle.Contains(at) ? lv.GetItemAt(at.X, at.Y) : null;
-            if (hit == null) hit = lv.FocusedItem;
-            if (hit == null) return false;
-            lv.FocusedItem = hit;
-            if (!hit.Selected)
+            bool mouse = lv.ClientRectangle.Contains(at);
+            var hit = mouse ? lv.GetItemAt(at.X, at.Y) : null;
+            if (hit == null && !mouse) hit = lv.FocusedItem;   // Shift+F10
+            var a = hit != null ? hit.Tag as InstalledApp : null;
+            // Over empty space only "Refresh the list".
+            foreach (ToolStripItem i in menu.Items) i.Visible = a != null || i == miRefresh;
+            if (a != null)
             {
-                lv.SelectedItems.Clear();
-                hit.Selected = true;
+                lv.FocusedItem = hit;
+                if (!hit.Selected)
+                {
+                    lv.SelectedItems.Clear();
+                    hit.Selected = true;
+                }
+                bool win32 = a.Kind == AppKind.Win32;
+                int n = a.Checked ? Checked().Count : 1;
+                miUninstall.Text = n > 1 ? L.T("Удалить отмеченные (" + n + ")", "Uninstall ticked (" + n + ")") : L.T("Удалить", "Uninstall");
+                miForce.Text = n > 1 ? L.T("Принудительно удалить отмеченные (" + n + ")…", "Force uninstall ticked (" + n + ")…") : L.T("Принудительное удаление…", "Force uninstall…");
+                miUninstall.Enabled = !uninstalling;
+                miForce.Enabled = !uninstalling && (win32 || n > 1);
+                miRestore.Visible = a.BackupReg != null;
+                miRestore.Enabled = !uninstalling;
+                miEntry.Visible = !a.Orphan;
+                miEntry.Enabled = !uninstalling && win32;
+                miFolder.Enabled = FolderOf(a) != null;
+                miRegistry.Visible = !a.Orphan;
+                miRegistry.Enabled = win32 && !a.Offline;   // a signed-out user's registry is not loaded for regedit
             }
-            var a = hit.Tag as InstalledApp;
-            if (a == null) return false;
-            bool win32 = a.Kind == AppKind.Win32;
-            int n = a.Checked ? Checked().Count : 1;
-            miUninstall.Text = n > 1 ? L.T("Удалить отмеченные (" + n + ")", "Uninstall ticked (" + n + ")") : L.T("Удалить", "Uninstall");
-            miForce.Text = n > 1 ? L.T("Принудительно удалить отмеченные (" + n + ")…", "Force uninstall ticked (" + n + ")…") : L.T("Принудительное удаление…", "Force uninstall…");
-            miUninstall.Enabled = !uninstalling;
-            miForce.Enabled = !uninstalling && (win32 || n > 1);
-            miEntry.Enabled = !uninstalling && win32;
-            miFolder.Enabled = FolderOf(a) != null;
-            miRegistry.Enabled = win32;
+            miRefresh.Enabled = !loading && !storeLoading && !uninstalling;
             // Follows the window's zoom.
             menu.Font = Theme.UiFont;
             menu.Padding = new Padding(0, S(4), 0, S(4));
@@ -498,10 +549,11 @@ namespace Wisp
                 // Leftovers are looked for only after the uninstallers are done with their files.
                 var leftovers = new List<Leftover>();
                 var keep = Keep.From(all.Where(x => !removed.Contains(x) && x.Kind == AppKind.Win32));
-                foreach (var a in removed)
-                {
-                    try { leftovers.AddRange(Leftovers.Find(a, keep)); } catch { }
-                }
+                using (UserHives.LoadAll())
+                    foreach (var a in removed)
+                    {
+                        try { leftovers.AddRange(Leftovers.Find(a, keep)); } catch { }
+                    }
                 Post(() => QueueDone(queue, removed, failed, leftovers));
             }) { IsBackground = true };
             th.SetApartmentState(ApartmentState.STA);
@@ -594,10 +646,11 @@ namespace Wisp
             var th = new Thread(() =>
             {
                 var found = new List<Leftover>();
-                foreach (var a in list)
-                {
-                    try { found.AddRange(ForceUninstall.Scan(a, keep)); } catch { }
-                }
+                using (UserHives.LoadAll())   // every user's registry, signed in or not
+                    foreach (var a in list)
+                    {
+                        try { found.AddRange(ForceUninstall.Scan(a, keep)); } catch { }
+                    }
                 var paths = new HashSet<string>(found.Select(f => f.Kind + "|" + f.Path + "|" + f.ValueName), StringComparer.OrdinalIgnoreCase);
                 found.AddRange(extra.Where(x => !paths.Contains(x.Kind + "|" + x.Path + "|" + x.ValueName)));
                 Post(() =>
@@ -658,6 +711,42 @@ namespace Wisp
             uninstalling = false;
             UpdateButtons();
             Host.UpdateStatus();
+        }
+
+        /// <summary>
+        /// Brings back the entry Wisp Cleaner removed earlier for a program that is still there, so it can be
+        /// removed the proper way — by its own uninstaller.
+        /// </summary>
+        void RestoreEntry(InstalledApp a)
+        {
+            if (a == null || a.BackupReg == null || uninstalling) return;
+            if (!ThemedDialog.Confirm(Host.Window, L.T("Вернуть запись", "Bring the entry back"),
+                    L.T("Вернуть " + L.Quote(a.Name) + " в список программ из резервной копии?\n" + a.BackupReg +
+                        "\n\nПосле этого программу можно удалить штатно — её собственным деинсталлятором (кнопка «Удалить»).",
+                        "Bring " + L.Quote(a.Name) + " back to the programs list from the backup?\n" + a.BackupReg +
+                        "\n\nThen the program can be removed the proper way — by its own uninstaller (the Remove button)."),
+                    L.T("Вернуть", "Bring back"), "\uE7A7", false)) return;
+            RemovalStarted();
+            Host.BeginBusy();
+            var th = new Thread(() =>
+            {
+                string error;
+                bool ok;
+                try { ok = OrphanApps.Restore(a, out error); }
+                catch (Exception ex) { ok = false; error = ex.Message; }
+                Post(() =>
+                {
+                    Host.EndBusy();
+                    RemovalDone();
+                    if (ok)
+                    {
+                        Host.ShowToast(L.Quote(a.Name) + L.T(" снова в списке программ", " is in the programs list again"), ToastKind.Success);
+                        RefreshData();
+                    }
+                    else Host.ShowToast(L.T("Не удалось вернуть запись: ", "Could not bring the entry back: ") + error, ToastKind.Error);
+                });
+            }) { IsBackground = true };
+            th.Start();
         }
 
         /// <summary>Removes only the "Apps &amp; features" entry (backed up): for entries of programs that are long gone.</summary>
@@ -796,11 +885,28 @@ namespace Wisp
                 chosen = items.Where(i => i.Checked).ToList();
             }
             if (chosen.Count == 0) return;
+            // A program that defends itself (antivirus self-defense) cannot be removed by force at all: tried
+            // anyway, it would lose its entry and keep running. Nothing is touched then.
+            var guarded = LeftoverRemover.ProtectedParts(items, chosen);
+            if (guarded.Count > 0)
+            {
+                ThemedDialog.Info(owner, L.T("Программа защищена от удаления", "The program protects itself"),
+                    L.T("Windows не даёт остановить эти части программы даже администратору — так работает самозащита антивирусов:\n\n",
+                        "Windows does not let even an administrator stop these parts of the program — this is how antivirus self-defense works:\n\n") +
+                    string.Join("\n", guarded.Take(12)) +
+                    L.T("\n\nПринудительное удаление здесь бессильно, поэтому ничего не тронуто. Удалите программу штатно — кнопкой «Удалить» " +
+                        "(если записи в списке нет, сначала «Вернуть запись в список программ» в меню строки); если она просит, отключите " +
+                        "самозащиту в её настройках. Либо воспользуйтесь утилитой удаления от производителя (для Kaspersky — kavremover).",
+                        "\n\nForced removal cannot help here, so nothing was touched. Remove the program the proper way — with the Remove button " +
+                        "(if it has no entry in the list, first use \"Bring the entry back to the programs list\" in its row's menu); if it asks, " +
+                        "turn its self-defense off in its settings. Or use the vendor's removal tool (for Kaspersky: kavremover)."), true);
+                return;
+            }
             var running = LeftoverRemover.RunningUnder(chosen);
             if (running.Count > 0 && !ThemedDialog.Confirm(owner, L.T("Программы будут закрыты", "Programs will be closed"),
                     L.T("Из удаляемых папок сейчас запущено — несохранённая работа в них пропадёт:\n\n", "These run from the folders being removed — unsaved work in them is lost:\n\n") +
                     string.Join("\n", running.Take(30)) + (running.Count > 30 ? "\n…" : ""),
-                    L.T("Закрыть и удалить", "Close and remove"), "", true)) return;
+                    L.T("Закрыть и удалить", "Close and remove"), "\uE74D", true)) return;
             if (started != null) started();
             host.BeginBusy();
             var th = new Thread(() =>
@@ -821,12 +927,23 @@ namespace Wisp
                             : historyPrefix + L.T(" (убрано: ", " (removed: ") + r.Done + ")");
                     string text;
                     if (r.Errors.Count > 0)
-                        text = L.T("Убрано: ", "Removed: ") + r.Done + L.T(" · не удалось: ", " · failed: ") + r.Errors.Count + " — " + r.Errors[0];
+                        text = L.T("Убрано: ", "Removed: ") + r.Done + L.T(" · не удалось: ", " · failed: ") + r.Errors.Count;
                     else
                         text = L.T("Убрано: ", "Removed: ") + r.Done + (r.Freed > 0 ? " · " + L.Size(r.Freed) : "");
-                    if (r.Reboot > 0) text += L.T(" · часть файлов занята и удалится после перезагрузки", " · some files are in use and go after a restart");
+                    if (r.Reboot > 0) text += L.T(" · остальное удалится после перезагрузки", " · the rest goes after a restart");
                     host.ShowToast(text, r.Errors.Count > 0 ? (r.Done > 0 ? ToastKind.Info : ToastKind.Error) : ToastKind.Success);
                     if (done != null) done();
+                    // Every item was looked up again after the removal: what is still there is listed with the reason.
+                    if (r.Errors.Count > 0)
+                        ThemedDialog.Info(owner, L.T("Удалено не всё", "Not everything was removed"),
+                            L.T("Удалено: " + r.Done + ". Осталось на месте: " + r.Errors.Count + ".\n\n", "Removed: " + r.Done + ". Still there: " + r.Errors.Count + ".\n\n") +
+                            string.Join("\n", r.Errors.Take(15)) + (r.Errors.Count > 15 ? "\n…" : "") +
+                            (r.Reboot > 0 ? L.T("\n\nЗанятые файлы (" + r.Reboot + ") удалятся после перезагрузки — при следующем запуске Wisp Cleaner проверит, что они удалились.",
+                                                 "\n\nFiles in use (" + r.Reboot + ") go after a restart — Wisp Cleaner checks at its next start that they did.") : ""), true);
+                    else if (r.Reboot > 0)
+                        ThemedDialog.Info(owner, L.T("Нужна перезагрузка", "A restart is needed"),
+                            L.T("Часть файлов занята другими программами (" + r.Reboot + ") и удалится при перезагрузке. При следующем запуске Wisp Cleaner проверит, что они действительно удалились.",
+                                "Some files are in use by other programs (" + r.Reboot + ") and go at the restart. At its next start Wisp Cleaner checks that they really did."), false);
                 };
                 try { owner.BeginInvoke(finish); } catch (InvalidOperationException) { }
             }) { IsBackground = false };   // closing the window does not cut a removal in half

@@ -488,7 +488,9 @@ namespace Wisp
                 for (int i = 0; i < pages.Length; i++) pages[i].Visible = i == idx;
             };
             if (instantTab) show();
-            else Transition.CrossFade(pageHost, show, 260, dir * S(36));
+            // A little longer and a shorter slide, settling gently (quartic ease-out). The tab underline (TabBar)
+            // slides for the same 320 ms, so both end on the same frame.
+            else Transition.CrossFade(pageHost, show, 320, dir * S(28), t => { float u = 1 - t; return 1 - u * u * u * u; });
             pages[idx].Activate();
             UpdateStatus();
         }

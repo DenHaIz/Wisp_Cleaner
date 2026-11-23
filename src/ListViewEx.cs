@@ -148,7 +148,8 @@ namespace Wisp
             {
                 PlaceSkeleton();
                 skeleton.Visible = true;
-                Shimmer.Run(skeleton, skeleton, () => skeleton.Visible && loading && Items.Count == 0);
+                // Not gated on Visible: pages load while hidden and must shimmer once opened (Run paints only when shown).
+                Shimmer.Run(skeleton, skeleton, () => !skeleton.IsDisposed && loading && Items.Count == 0);
             }
             else skeleton.Visible = false;
         }
@@ -479,7 +480,7 @@ namespace Wisp
                     if (t >= 1) { flash.Remove(it); flashColor.Remove(it); }
                     else flash[it] = 1 - t;
                     InvalidateRow(it);
-                }, null, t => t * t);
+                }, null, t => t >= 1 ? 1 : Anim.SineInOut(t));   // eases out at the end too (t² snapped off)
             }
         }
 

@@ -2,7 +2,6 @@
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
-using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
 namespace Wisp
@@ -24,6 +23,8 @@ namespace Wisp
         public Card()
         {
             Padding = new Padding(Theme.S(1));
+            // The rounded corners and the border depend on the size: a partial repaint left old lines behind.
+            SetStyle(ControlStyles.ResizeRedraw, true);
         }
 
         public void ApplyTheme()
@@ -36,11 +37,20 @@ namespace Wisp
         {
             var p = Theme.Current;
             var g = e.Graphics;
-            g.Clear(Parent != null ? Parent.BackColor : p.Bg);
+            // The body and the border cover everything but the corners: only those get the parent's colour.
+            int c = Theme.S(8) + 1;
+            using (var b = new SolidBrush(Parent != null ? Parent.BackColor : p.Bg))
+            {
+                g.FillRectangle(b, 0, 0, c, c);
+                g.FillRectangle(b, Width - c, 0, c, c);
+                g.FillRectangle(b, 0, Height - c, c, c);
+                g.FillRectangle(b, Width - c, Height - c, c, c);
+            }
             g.SmoothingMode = SmoothingMode.AntiAlias;
             var r = new RectangleF(0.5f, 0.5f, Width - 1, Height - 1);
-            Theme.FillRound(g, p.Surface, r, Theme.S(8));
-            Theme.DrawRound(g, p.Border, r, Theme.S(8));
+            // Rectangles with anti-aliased corners only: a whole anti-aliased card cost ~8 ms a paint at 150 %.
+            Theme.FillRoundFast(g, p.Surface, r, Theme.S(8));
+            Theme.DrawRoundFast(g, p.Border, r, Theme.S(8));
             if (Title.Length > 0 && TitleHeight > 0)
                 TextDraw.DrawText(g, Title, Theme.HeadFont, new Rectangle(Theme.S(18), 0, Width - Theme.S(36), TitleHeight), p.Text,
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
@@ -65,6 +75,8 @@ namespace Wisp
         {
             text = text ?? "";
             if (text == Text) return;
+            // Only a number changed (a total, a count): swapped in place; a fade under way carries on to it.
+            if (Anim.OnlyNumbersDiffer(text, Text)) { Text = text; Invalidate(); return; }
             // Mid-fade the line still mostly shows the old text: keep fading that one out.
             if (alpha.Value >= 0.5f) previous = Text;
             Text = text;
@@ -183,7 +195,6 @@ namespace Wisp
     /// </summary>
     static class Shimmer
     {
-        static readonly System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
         const int Period = 1500;
 
         public static Brush Make(int width, Color bg)
@@ -194,7 +205,8 @@ namespace Wisp
             float w = Math.Max(1, width);
             float band = Math.Max(Theme.S(140), w * 0.3f);
             float left = -2 * band, span = w + 4 * band;
-            float phase = Anim.EaseInOut((clock.ElapsedMilliseconds % Period) / (float)Period);
+            // The display frame's time: the band moves the same distance every refresh.
+            float phase = Anim.EaseInOut((float)(Anim.FrameNow % Period) / Period);
             float c = -band + phase * (w + 2 * band);
             var brush = new LinearGradientBrush(new RectangleF(left, 0, span, 1), bar, bar, 0f);
             brush.InterpolationColors = new ColorBlend
@@ -236,7 +248,7 @@ namespace Wisp
             Anim.Frame(key, () =>
             {
                 if (c.IsDisposed || !loading()) return false;
-                if (c.Visible) c.Invalidate();
+                if (Anim.Shown(c)) c.Invalidate();
                 return true;
             });
         }
@@ -402,7 +414,38 @@ namespace Wisp
         {
             float from;
             if (!map.TryGetValue(key, out from)) from = 0;
-            Anim.Run(Tuple.Create(this, key, tag), ms, t => { map[key] = from + (to - from) * t; ClampScroll(); Invalidate(); }, null, ease);
+            // Hover changes one row: only that row is painted again.
+            object row = tag == "h" ? key : (tag == "ha" ? ((Tuple<object, string>)key).Item1 : null);
+            Anim.Run(Tuple.Create(this, key, tag), ms, t =>
+            {
+                map[key] = from + (to - from) * t;
+                if (row != null) InvalidateRow(row);
+                else
+                {
+                    ClampScroll();
+                    Invalidate();
+                }
+            }, null, ease);
+        }
+
+        /// <summary>Repaints the row of a group or an item where it is drawn now (everything when it is not found).</summary>
+        void InvalidateRow(object o)
+        {
+            float y = -(float)Math.Round(scroll);
+            foreach (var g in Groups)
+            {
+                if (g == o) { Invalidate(new Rectangle(0, (int)y - 1, Width, GroupH + 2)); return; }
+                y += GroupH;
+                float ex = Get(expand, g);
+                int idx = g.Items.IndexOf(o as CatItem);
+                if (idx >= 0)
+                {
+                    Invalidate(new Rectangle(0, (int)(y + idx * ItemH - (1 - ex) * S(10)) - 1, Width, ItemH + 2));
+                    return;
+                }
+                y += (float)Math.Round(g.Items.Count * ItemH * ex);
+            }
+            Invalidate();
         }
 
         float Get(Dictionary<object, float> map, object key)
@@ -433,8 +476,9 @@ namespace Wisp
         void ScrollTo(float target)
         {
             scrollTarget = Math.Max(0, Math.Min(MaxScroll, target));
-            float from = scroll, to = scrollTarget;
-            Anim.Run(scrollKey, 220, t => { scroll = from + (to - from) * t; Invalidate(); });
+            // A spring that follows the target: fast wheel turns glide instead of surging and stopping on
+            // every notch, as a tween restarted per notch did.
+            Anim.Follow(scrollKey, () => scroll, v => { scroll = v; Invalidate(); }, () => scrollTarget);
         }
 
         protected override void OnMouseWheel(MouseEventArgs e)
@@ -649,12 +693,14 @@ namespace Wisp
             // Whole pixels everywhere: text snaps to pixels, so shapes must too or rows shimmer while moving.
             float y = -(float)Math.Round(scroll);
             int w = Width - S(10);
+            // Only what lies in the area being repainted (a hover repaints one row).
+            var clip = e.ClipRectangle;
             for (int gi = 0; gi < Groups.Count; gi++)
             {
                 var grp = Groups[gi];
                 float ex = Get(expand, grp);
                 float block = (float)Math.Round(grp.Items.Count * ItemH * ex);
-                if (y + GroupH + block >= 0 && y < Height) PaintGroup(g, grp, y, w, bg, ex);
+                if (y + GroupH >= clip.Top && y < Math.Min(Height, clip.Bottom)) PaintGroup(g, grp, y, w, bg, ex);
                 y += GroupH;
                 if (block > 0.5f && y < Height && y + block > 0)
                 {
@@ -663,7 +709,7 @@ namespace Wisp
                     for (int i = 0; i < grp.Items.Count; i++)
                     {
                         float iy = (float)Math.Round(y + i * ItemH - (1 - ex) * S(10));
-                        if (iy + ItemH < 0 || iy > Height) continue;
+                        if (iy + ItemH < Math.Max(0, clip.Top) || iy > Math.Min(Height, clip.Bottom)) continue;
                         PaintItem(g, grp.Items[i], iy, w, bg, ex);
                     }
                     g.Restore(state);
@@ -870,17 +916,42 @@ namespace Wisp
         float shownBytes, progress, dust, sparkleReady, sparkleDone, numFade = 1, capFade = 1, phase;
         double lastPhaseAt = -1;
         long targetBytes;
+        // Cleaning: the progress shown follows the reported one frame by frame (restarting a tween on every
+        // report, several a second, reset its speed each time and the arc moved in jerks). The number in the
+        // middle does the same while frames run (scanning, cleaning): it counts at an even pace, not in surges.
+        float progressTarget, bytesTarget;
+        bool followBytes;
+        float lastStep = -1;
+        // The arc's speed as drawn (deg/s), so a spinning arc that settles keeps its speed and brakes from it
+        // (a plain ease started it at a speed of its own: it braked hard or sped up first).
+        float startVel, sweepVel, velSec = -1, velStart, velSweep;
+        bool hermite;
+        float m0Start, m0Sweep;
         string caption = "", prevCaption = "", prevNumber = "", lastNumber = "";
         readonly Tweened hover, press;
-        readonly System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
         readonly object frameKey = new object(), numKey = new object(), travelKey = new object(), progKey = new object(),
             dustKey = new object(), readyKey = new object(), doneKey = new object(), numFadeKey = new object(), capKey = new object();
         bool running;
-        public bool Clickable;
+        bool clickable;
         Font numFont, capFont;
 
+        /// <summary>The ring is a button (there is something to clean): hand cursor and hover.</summary>
+        public bool Clickable
+        {
+            get { return clickable; }
+            set
+            {
+                if (clickable == value) return;
+                clickable = value;
+                Cursor = value ? Cursors.Hand : Cursors.Default;
+                if (!value && hover != null) hover.To(0, 200);
+            }
+        }
+
         float RingSize { get { return (Math.Min(Width, Height) - S(24)) * 0.84f; } }
-        float Sec { get { return clock.ElapsedMilliseconds / 1000f; } }
+        // Display frame time, so the arc moves the same amount every refresh (not when the paint happens to run).
+        readonly double born = Anim.Now;
+        float Sec { get { return (float)((Anim.FrameNow - born) / 1000); } }
 
         /// <summary>The ring grows with the window; its number and caption grow with it.</summary>
         void FitFonts(float ring)
@@ -924,7 +995,7 @@ namespace Wisp
                 if (value == caption) return;
                 // Only the numbers changed ("cleaning… 34%" → "35%"): no new fade (one running goes on), it
                 // would flicker on every step.
-                if (Regex.Replace(value, @"\d", "") == Regex.Replace(caption, @"\d", ""))
+                if (Anim.OnlyNumbersDiffer(value, caption))
                 {
                     caption = value;
                     Invalidate();
@@ -953,18 +1024,33 @@ namespace Wisp
             // Keep turning clockwise: the target is taken a whole number of turns ahead of the arc.
             startOffset = 360f * (float)Math.Ceiling((fromStart - targetStart) / 360f - 0.001f);
             int ms;
-            if (prev == RingState.Scanning && s != RingState.Scanning)
+            if ((prev == RingState.Scanning || prev == RingState.Cleaning) && s != RingState.Scanning)
             {
-                ms = 1000;
-                travelEase = EaseOutCubic;   // a spinning arc slows down into place
+                // A moving arc (spinning, or filling up while cleaning) goes on into place from the speed it has
+                // (Hermite: that speed at the start, at rest at the end), far enough ahead that it never has to
+                // turn back. Starting from rest instead, it stopped dead for a moment and then set off again.
+                ms = prev == RingState.Scanning ? 1000 : 850;
+                hermite = true;
+                m0Start = Math.Max(0, startVel) * ms / 1000f;
+                m0Sweep = sweepVel * ms / 1000f;
+                while (targetStart + startOffset - fromStart < m0Start / 3) startOffset += 360;
+                travelEase = x => x;
             }
             else
             {
+                hermite = false;
                 ms = s == RingState.Scanning ? 650 : (s == RingState.Cleaning ? 550 : 850);
                 travelEase = Anim.EaseInOut;
             }
             travel = 0;
-            Anim.Run(travelKey, ms, t => { travel = travelEase(t); Invalidate(); }, null, x => x);
+            // Timed from the display frame the arc was last drawn for, not from now: the first frame of the
+            // travel then moves a whole frame's worth (a spinning arc that settles kept stalling for one frame).
+            float travelFrom = Sec, travelSec = ms / 1000f;
+            Anim.Run(travelKey, ms, t =>
+            {
+                travel = t >= 1 ? 1 : travelEase(Math.Max(t, Math.Min(1, (Sec - travelFrom) / travelSec)));
+                Invalidate();
+            }, null, x => x);
 
             // Dust flies while scanning, cleaning and when ready; a clean ring has none.
             To(dustKey, () => dust, v => dust = v, s == RingState.Done ? 0 : 1, 450, 0);
@@ -974,22 +1060,50 @@ namespace Wisp
             if (s == RingState.Cleaning && prev != RingState.Cleaning)
             {
                 Anim.Cancel(progKey);
-                progress = 0;
+                progress = progressTarget = 0;
             }
 
             bool needsFrames = s == RingState.Scanning || s == RingState.Cleaning;
             if (needsFrames && !running)
             {
                 running = true;
+                lastStep = -1;
                 Anim.Frame(frameKey, () =>
                 {
                     if (IsDisposed) return running = false;
-                    if (Visible) Invalidate();
-                    running = state == RingState.Scanning || state == RingState.Cleaning;
+                    Step();
+                    if (Anim.Shown(this)) Invalidate();
+                    // A number still counting keeps the frames going until it arrives.
+                    running = state == RingState.Scanning || state == RingState.Cleaning || followBytes;
                     return running;
                 });
             }
             Invalidate();
+        }
+
+        /// <summary>Once per display frame while frames run: progress and number move by the frame's time.</summary>
+        void Step()
+        {
+            float now = Sec;
+            float dt = lastStep < 0 ? 0 : Math.Max(0, Math.Min(0.1f, now - lastStep));
+            lastStep = now;
+            if (state == RingState.Cleaning && progress < progressTarget)
+            {
+                // Eases towards the reported value: quick after a big step, never past it, never stop-and-go;
+                // a little minimum speed so the last fraction does not crawl.
+                progress += (progressTarget - progress) * (1 - (float)Math.Exp(-dt / 0.3f));
+                progress = Math.Min(progressTarget, progress + dt * 0.02f);
+            }
+            if (followBytes)
+            {
+                float d = bytesTarget - shownBytes;
+                shownBytes += d * (1 - (float)Math.Exp(-dt / 0.22f));
+                if (Math.Abs(bytesTarget - shownBytes) < Math.Max(1f, Math.Abs(bytesTarget) * 0.0005f))
+                {
+                    shownBytes = bytesTarget;
+                    followBytes = false;
+                }
+            }
         }
 
         /// <summary>Animates a value from where it is to a target (with an optional delay); growing ones overshoot a little.</summary>
@@ -1009,11 +1123,12 @@ namespace Wisp
             else run();
         }
 
-        static float EaseOutCubic(float t)
+        /// <summary>From p0 moving at m0 (distance per whole travel) to p1 at rest, t 0..1.</summary>
+        static float Hermite(float p0, float p1, float m0, float t)
         {
             t = Math.Max(0, Math.Min(1, t));
-            float u = 1 - t;
-            return 1 - u * u * u;
+            float t2 = t * t, t3 = t2 * t;
+            return (2 * t3 - 3 * t2 + 1) * p0 + (t3 - 2 * t2 + t) * m0 + (-2 * t3 + 3 * t2) * p1;
         }
 
         /// <summary>Overshooting ease for the sparkle "pop".</summary>
@@ -1033,12 +1148,14 @@ namespace Wisp
                 {
                     // Loader: the head runs ahead during the first half of a cycle, the tail catches up in the
                     // second; the whole arc also turns slowly. Seamless from cycle to cycle.
-                    const float period = 1.5f, reach = 250f, min = 22f;
+                    // A gentle sine ease and a longer cycle: the head never moves more than ~8 deg a frame at
+                    // 60 Hz (the cubic one shot ~19 deg, which on a big ring showed as steps).
+                    const float period = 2.1f, reach = 230f, min = 24f;
                     float cyc = sec / period;
                     float k = (float)Math.Floor(cyc), u = cyc - k;
-                    float head = reach * Anim.EaseInOut(Math.Min(1, u * 2));
-                    float tail = reach * Anim.EaseInOut(Math.Max(0, u * 2 - 1));
-                    start = Logo.SolidStart + sec * 140 + k * reach + tail;
+                    float head = reach * Anim.SineInOut(Math.Min(1, u * 2));
+                    float tail = reach * Anim.SineInOut(Math.Max(0, u * 2 - 1));
+                    start = Logo.SolidStart + sec * 120 + k * reach + tail;
                     sweep = min + head - tail;
                     return;
                 }
@@ -1067,6 +1184,7 @@ namespace Wisp
                 // A new count (cleaning starts from zero): the old number leaves upwards, the new one comes in.
                 string before = NumberText();
                 Anim.Cancel(numKey);
+                followBytes = false;
                 shownBytes = bytes;
                 if (IsHandleCreated && Visible && before != NumberText() && numFade >= 1)
                 {
@@ -1077,15 +1195,27 @@ namespace Wisp
                 Invalidate();
                 return;
             }
+            if (running)
+            {
+                // Frames run anyway (scanning, cleaning): the number follows the latest total frame by frame;
+                // a 700 ms tween restarted on every report counted in surges.
+                Anim.Cancel(numKey);
+                bytesTarget = bytes;
+                followBytes = true;
+                return;
+            }
+            followBytes = false;
             Anim.Run(numKey, 700, t => { shownBytes = from + (bytes - from) * t; Invalidate(); });
         }
 
         /// <summary>Cleaning progress 0..1; the arc glides to it (it never moves backwards).</summary>
         public void SetProgress(float value)
         {
-            float from = progress;
-            if (value < from) value = from;
-            Anim.Run(progKey, 200, t => { progress = from + (value - from) * t; Invalidate(); });
+            value = Math.Max(0, Math.Min(1, value));
+            if (value <= progressTarget) return;
+            progressTarget = value;
+            // No frames running (not cleaning): shown as it is.
+            if (!running || state != RingState.Cleaning) { progress = value; Invalidate(); }
         }
 
         protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); if (Clickable) hover.To(1, 140); }
@@ -1112,8 +1242,6 @@ namespace Wisp
             g.Clear(bg);
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            Cursor = Clickable ? Cursors.Hand : Cursors.Default;
-            if (!Clickable && hover.Value > 0.001f && hover.Value < 0.999f) hover.To(0, 200);
 
             float scale = 1 + hover.Value * 0.02f - press.Value * 0.03f;
             float ring = RingSize * scale;
@@ -1142,17 +1270,42 @@ namespace Wisp
             // ----- the arc -----
             float ts, tw;
             Target(state, sec, out ts, out tw);
-            float start = Anim.Lerp(fromStart, ts + startOffset, travel);
-            float sweep = Math.Max(0, Anim.Lerp(fromSweep, tw, travel));
+            float start, sweep;
+            if (hermite)
+            {
+                start = Hermite(fromStart, ts + startOffset, m0Start, travel);
+                sweep = Math.Max(0, Math.Min(360, Hermite(fromSweep, tw, m0Sweep, travel)));
+            }
+            else
+            {
+                start = Anim.Lerp(fromStart, ts + startOffset, travel);
+                sweep = Math.Max(0, Anim.Lerp(fromSweep, tw, travel));
+            }
             if (travel >= 1)
             {
                 // Settled: forget the extra turns so the numbers stay small.
                 startOffset = 0;
                 start = ts;
+                sweep = Math.Max(0, tw);
+                hermite = false;
             }
+            // The speed as drawn, for a settle that keeps it (turns taken off count as nothing).
+            float dtv = sec - velSec;
+            if (dtv > 0.004f && dtv < 0.2f)
+            {
+                float ds = start - velStart;
+                ds -= 360f * (float)Math.Round(ds / 360f);
+                startVel = ds / dtv;
+                sweepVel = (sweep - velSweep) / dtv;
+            }
+            else if (dtv >= 0.2f) startVel = sweepVel = 0;
+            velSec = sec;
+            velStart = start;
+            velSweep = sweep;
             lastStart = start % 360f;
             if (lastStart < 0) lastStart += 360;
             lastSweep = sweep;
+            if (Anim.FrameLog != null) Anim.Log(string.Format(System.Globalization.CultureInfo.InvariantCulture, "R\t{0:F1}\t{1:F2}\t{2:F2}\t{3}", Anim.Now, start, sweep, state));
 
             // The mark is drawn from 12 o'clock: turned to where the arc starts now.
             float dustNow = dust * (state == RingState.Cleaning ? Math.Min(1, (1 - progress) * 8) : 1) * Math.Min(1, sweep / 40f);

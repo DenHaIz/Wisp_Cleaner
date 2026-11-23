@@ -102,13 +102,10 @@ namespace Wisp
 
         public int PreferredWidth
         {
-            get
-            {
-                int w = S(12) * 2;
-                if (Glyph.Length > 0 && Theme.HasGlyphs) w += S(16) + (Text.Length > 0 ? S(8) : 0);
-                return w + MeasureWidth(Text, Font);
-            }
+            get { return S(12) * 2 + GlyphPart + MeasureWidth(Text, Font); }
         }
+
+        int GlyphPart { get { return Glyph.Length > 0 && Theme.HasGlyphs ? S(16) + (Text.Length > 0 ? S(8) : 0) : 0; } }
 
         /// <summary>Fades the button in (used when it becomes visible).</summary>
         public void Appear()
@@ -144,9 +141,13 @@ namespace Wisp
         {
             base.OnTextChanged(e);
             // A visible button cross-fades its caption ("Check" → "Install (3)"); a hidden one just changes.
-            if (Visible && IsHandleCreated && shownText.Length > 0 && Text.Length > 0)
+            // "Clean (3)" -> "(4)": a counter just changes (a fade under way carries on to it); fading it out
+            // and back in on every tick read as blinking.
+            if (Anim.OnlyNumbersDiffer(shownText, Text)) { }
+            else if (Visible && IsHandleCreated && shownText.Length > 0 && Text.Length > 0)
             {
-                oldText = shownText;
+                // Mid-fade the button still mostly shows the old caption: that one keeps fading out.
+                if (textFade >= 0.5f) oldText = shownText;
                 textFade = 0;
                 Anim.Run(textKey, 220, t => { textFade = t; Invalidate(); });
             }
@@ -212,7 +213,7 @@ namespace Wisp
             Theme.FillRound(g, bg, r, S(6));
             if (Kind == ButtonKind.Normal || Kind == ButtonKind.Danger) Theme.DrawRound(g, border, r, S(6));
 
-            int content = PreferredWidth - S(24);
+            int content = GlyphPart + MeasureWidth(Text, Font);
             int x = Math.Max(S(12), (Width - content) / 2);
             if (Glyph.Length > 0 && Theme.HasGlyphs)
             {
@@ -226,7 +227,10 @@ namespace Wisp
                 {
                     // Old caption slides up and out, the new one comes up from below.
                     int dy = (int)Math.Round(S(6) * textFade);
-                    TextDraw.DrawText(g, oldText, Font, new Rectangle(tr.X, tr.Y - dy, tr.Width, tr.Height), Anim.Blend(bg, fg, 1 - textFade), TextLeft);
+                    // Each caption centred by its own width (the old one placed by the new width jumped sideways).
+                    int ox = tr.X + (MeasureWidth(Text, Font) - MeasureWidth(oldText, Font)) / 2;
+                    if (Math.Max(S(12), (Width - content) / 2) == S(12)) ox = tr.X;
+                    TextDraw.DrawText(g, oldText, Font, new Rectangle(ox, tr.Y - dy, Width - ox - S(4), tr.Height), Anim.Blend(bg, fg, 1 - textFade), TextLeft);
                     TextDraw.DrawText(g, Text, Font, new Rectangle(tr.X, tr.Y + S(6) - dy, tr.Width, tr.Height), Anim.Blend(bg, fg, textFade), TextLeft);
                 }
                 else TextDraw.DrawText(g, Text, Font, tr, fg, TextLeft);
@@ -264,12 +268,19 @@ namespace Wisp
             Cursor = Cursors.Hand;
         }
 
+        /// <summary>Repaints one tab only (hover and selection colours change one tab at a time).</summary>
+        void InvalidateTab(int i)
+        {
+            if (i >= 0 && i < rects.Length) Invalidate(rects[i]);
+        }
+
         public void AddTab(string text, string glyph)
         {
+            int i = tabs.Count;
             tabs.Add(text);
             glyphs.Add(glyph);
-            hovers.Add(new Tweened(Invalidate));
-            sels.Add(new Tweened(Invalidate, tabs.Count - 1 == selected ? 1 : 0));
+            hovers.Add(new Tweened(() => InvalidateTab(i)));
+            sels.Add(new Tweened(() => InvalidateTab(i), i == selected ? 1 : 0));
             Relayout();
             var ind = IndicatorTarget(selected);
             indX = ind.X;
@@ -290,6 +301,9 @@ namespace Wisp
         int GlyphSpace { get { return Theme.HasGlyphs ? S(20) + S(8) : 0; } }
 
         static FontFamily glyphFamily;
+        // Glyph outlines at the origin, per glyph and size: building them (AddString) on every paint of every
+        // tab made each frame of the underline's slide expensive.
+        static readonly Dictionary<string, GraphicsPath> glyphPaths = new Dictionary<string, GraphicsPath>();
 
         /// <summary>
         /// Tab icons: a little larger than the text and drawn as an outlined shape, so MDL2's hairline strokes
@@ -299,18 +313,34 @@ namespace Wisp
         {
             if (!Theme.HasGlyphs || string.IsNullOrEmpty(glyph)) return;
             if (glyphFamily == null) glyphFamily = new FontFamily("Segoe MDL2 Assets");
-            using (var path = new GraphicsPath())
+            float size = 17f * Theme.Scale;
+            string key = glyph + "|" + size.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            GraphicsPath path;
+            if (!glyphPaths.TryGetValue(key, out path))
             {
-                path.AddString(glyph, glyphFamily, (int)FontStyle.Regular, 17f * Theme.Scale, PointF.Empty, StringFormat.GenericTypographic);
-                var b = path.GetBounds();
+                path = new GraphicsPath();
+                path.AddString(glyph, glyphFamily, (int)FontStyle.Regular, size, PointF.Empty, StringFormat.GenericTypographic);
+                var bb = path.GetBounds();
                 using (var m = new Matrix())
                 {
-                    m.Translate((float)Math.Round(r.X + (r.Width - b.Width) / 2f - b.X), (float)Math.Round(r.Y + (r.Height - b.Height) / 2f - b.Y));
+                    m.Translate(-bb.X, -bb.Y);
                     path.Transform(m);
                 }
-                using (var brush = new SolidBrush(c)) g.FillPath(brush, path);
-                using (var pen = new Pen(c, 0.85f * Theme.Scale) { LineJoin = LineJoin.Round }) g.DrawPath(pen, path);
+                glyphPaths[key] = path;
             }
+            var b = path.GetBounds();
+            var state = g.Save();
+            g.TranslateTransform((float)Math.Round(r.X + (r.Width - b.Width) / 2f), (float)Math.Round(r.Y + (r.Height - b.Height) / 2f));
+            using (var brush = new SolidBrush(c)) g.FillPath(brush, path);
+            using (var pen = new Pen(c, 0.85f * Theme.Scale) { LineJoin = LineJoin.Round }) g.DrawPath(pen, path);
+            g.Restore(state);
+        }
+
+        /// <summary>The strip the underline is drawn in, between two positions (with a pixel to spare).</summary>
+        Rectangle UnderlineStrip(float x0, float w0, float x1, float w1)
+        {
+            int left = (int)Math.Floor(Math.Min(x0, x1)) - S(2), right = (int)Math.Ceiling(Math.Max(x0 + w0, x1 + w1)) + S(2);
+            return new Rectangle(left, Height - S(3) - 1, right - left, S(3) + 2);
         }
 
         void Relayout()
@@ -344,14 +374,16 @@ namespace Wisp
                 sels[value].To(1, 220);
                 float fx = indX, fw = indW;
                 var target = IndicatorTarget(value);
-                // As long as the page transition (MainForm): both end on the same frame, before the
-                // new page's first real paint.
-                Anim.Run(indKey, 260, t =>
+                // As long as the page transition (MainForm, 320 ms): both end on the same frame. A sine ease:
+                // its fastest step is half of the cubic one's, so the slide stays even. Only the strip under the
+                // tabs is repainted on each frame.
+                Anim.Run(indKey, 320, t =>
                 {
+                    float px = indX, pw = indW;
                     indX = Anim.Lerp(fx, target.X, t);
                     indW = Anim.Lerp(fw, target.Width, t);
-                    Invalidate();
-                }, null, Anim.EaseInOut);
+                    Invalidate(UnderlineStrip(px, pw, indX, indW));
+                }, null, Anim.SineInOut);
                 if (SelectedIndexChanged != null) SelectedIndexChanged(this, EventArgs.Empty);
             }
         }
@@ -399,9 +431,12 @@ namespace Wisp
             Color pb = ParentBg;
             g.Clear(pb);
             g.SmoothingMode = SmoothingMode.AntiAlias;
+            var clip = e.ClipRectangle;
             for (int i = 0; i < tabs.Count; i++)
             {
                 var r = rects[i];
+                // Only the tabs in the area being repainted (the underline's strip, a hovered tab).
+                if (!r.IntersectsWith(clip)) continue;
                 float h = hovers[i].Value, s = sels[i].Value;
                 if (h > 0.01f)
                     Theme.FillRound(g, Anim.Blend(pb, p.Hover, h * 0.7f * (1 - s)),
@@ -416,6 +451,7 @@ namespace Wisp
                 TextDraw.DrawText(g, tabs[i], Font, new Rectangle(x, 0, r.Right - x, r.Height), c, TextLeft);
             }
             Theme.FillRound(g, p.Accent, new RectangleF(indX, Height - S(3), indW, S(3)), S(2));
+            if (Anim.FrameLog != null) Anim.Log(string.Format(System.Globalization.CultureInfo.InvariantCulture, "U\t{0:F1}\t{1:F1}", Anim.Now, indX));
         }
     }
 
@@ -573,7 +609,8 @@ namespace Wisp
                 if (value == selected) return;
                 selected = value;
                 float from = pill;
-                Anim.Run(pillKey, 300, t => { pill = Anim.Lerp(from, value, t); Invalidate(); }, null, Anim.EaseInOut);
+                // Sine ease: the pill's fastest step is about half the cubic one's, so it glides evenly.
+                Anim.Run(pillKey, 300, t => { pill = Anim.Lerp(from, value, t); Invalidate(); }, null, Anim.SineInOut);
                 if (SelectedIndexChanged != null) SelectedIndexChanged(this, EventArgs.Empty);
             }
         }
@@ -757,7 +794,6 @@ namespace Wisp
     class LoadingBar : SkinControl
     {
         readonly Tweened alpha;
-        readonly System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
         readonly object frameKey = new object();
         bool active;
 
@@ -772,7 +808,8 @@ namespace Wisp
             alpha.To(1, 200);
             Anim.Frame(frameKey, () =>
             {
-                Invalidate();
+                if (IsDisposed) return false;
+                if (Anim.Shown(this)) Invalidate();
                 return active || alpha.Value > 0.01f;
             });
         }
@@ -789,7 +826,8 @@ namespace Wisp
             Color pb = ParentBg;
             g.Clear(pb);
             if (alpha.Value <= 0.01f) return;
-            float phase = (clock.ElapsedMilliseconds % 1400) / 1400f;
+            // The display frame's time: the bar moves the same distance every refresh, however late the paint runs.
+            float phase = (float)(Anim.FrameNow % 1400 / 1400);
             float eased = Anim.EaseInOut(phase);
             float w = Width * 0.35f;
             float x = -w + eased * (Width + w);

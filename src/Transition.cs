@@ -22,7 +22,7 @@ namespace Wisp
             foreach (var o in active.ToArray()) o.Finish();
         }
 
-        public static void CrossFade(Control target, Action change, int ms = 200, int slideX = 0)
+        public static void CrossFade(Control target, Action change, int ms = 200, int slideX = 0, Func<float, float> ease = null)
         {
             if (target == null || target.Parent == null || !target.IsHandleCreated || !target.Visible ||
                 target.Width < 2 || target.Height < 2)
@@ -41,7 +41,7 @@ namespace Wisp
                 {
                     // An enclosing area is mid-transition toward a picture taken before this change.
                     // Changing now would pop in when that overlay lifts: run this one right after it.
-                    o.Then(() => CrossFade(target, change, ms, slideX));
+                    o.Then(() => CrossFade(target, change, ms, slideX, ease));
                     return;
                 }
             }
@@ -68,12 +68,13 @@ namespace Wisp
             ov.Update();
             double t1 = Anim.Now;
 
-            change();
+            try { change(); }
+            catch { ov.Finish(); throw; }
             double t2 = Anim.Now;
 
             GdiBitmap after = GdiBitmap.Snap(target);
             if (after == null) { ov.Finish(); return; }
-            ov.Start(after, slideX, ms);
+            ov.Start(after, slideX, ms, ease);
             if (Anim.FrameLog != null)
                 Anim.Log(string.Format(System.Globalization.CultureInfo.InvariantCulture, "T\t{0:F1}\t{1}\tbefore {2:F1}\tchange {3:F1}\tafter {4:F1}",
                     t0, target.GetType().Name + " " + target.Width + "x" + target.Height, t1 - t0, t2 - t1, Anim.Now - t2));
@@ -81,11 +82,27 @@ namespace Wisp
 
         class Overlay : Control
         {
+            [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+            [DllImport("user32.dll")] static extern bool RedrawWindow(IntPtr h, IntPtr rect, IntPtr region, uint flags);
+            const int WM_SETREDRAW = 0x000B;
+
             public readonly Control Target;
             GdiBitmap before, after;
             int slide;
             float t;
-            bool finished;
+            bool finished, frozen;
+
+            /// <summary>
+            /// While the overlay shows the pictures, what is under it is not painted at all: lists still
+            /// appearing, loaders and rings went on repainting the hidden page in every frame, which on a
+            /// slow laptop made the transition drop frames. Painted once, whole, when the overlay lifts.
+            /// </summary>
+            void Freeze(bool on)
+            {
+                if (on == frozen || Target.IsDisposed || !Target.IsHandleCreated) return;
+                frozen = on;
+                SendMessage(Target.Handle, WM_SETREDRAW, (IntPtr)(on ? 0 : 1), IntPtr.Zero);
+            }
             readonly object key = new object();
             List<Action> then;
 
@@ -107,17 +124,20 @@ namespace Wisp
             public void Hold(GdiBitmap picture)
             {
                 Anim.Cancel(key);
+                // The change and its snapshot need the area drawable again (a frozen window prints nothing).
+                Freeze(false);
                 Swap(ref before, picture);
                 Swap(ref after, null);
                 t = 0;
                 Invalidate();
             }
 
-            public void Start(GdiBitmap picture, int slideX, int ms)
+            public void Start(GdiBitmap picture, int slideX, int ms, Func<float, float> ease = null)
             {
                 Swap(ref after, picture);
                 slide = slideX;
-                Anim.Run(key, ms, v => { t = v; Invalidate(); Update(); }, Finish);
+                Freeze(true);
+                Anim.Run(key, ms, v => { t = v; Invalidate(); Update(); }, Finish, ease);
             }
 
             /// <summary>The frame currently on screen, used as the starting point of an interrupting transition.</summary>
@@ -162,8 +182,14 @@ namespace Wisp
                 finished = true;
                 Anim.Cancel(key);
                 active.Remove(this);
+                bool wasFrozen = frozen;
+                Freeze(false);
                 if (Parent != null) Parent.Controls.Remove(this);
                 Dispose();
+                // The area shows the final picture still: paint it now, whole, as it really is.
+                // RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW
+                if (wasFrozen && !Target.IsDisposed && Target.IsHandleCreated)
+                    RedrawWindow(Target.Handle, IntPtr.Zero, IntPtr.Zero, 0x0001 | 0x0004 | 0x0080 | 0x0100);
                 if (then != null)
                 {
                     var queued = then;

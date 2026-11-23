@@ -24,7 +24,10 @@ namespace Wisp
 
         public LeftoverKind Kind;
         public string Final;            // folders: their real path when found; removal requires it unchanged
-        public bool IsEntry;            // the program's own uninstall entry: removed last, only if its folders went
+        public bool IsEntry;            // the program's own uninstall entry: removed last, only if the program is really gone
+        public bool WithEntry;          // goes together with the entry (Windows Installer registration)
+        public bool Protected;          // a service Windows starts as a protected process: nothing can stop or delete it
+        public List<string> Evidence;   // entry only: the program's own files; while one exists, the program is not gone
         public string Path = "";        // what the user sees: folder, file, registry path, service or task
         public RegistryHive Hive;
         public RegistryView View;
@@ -54,7 +57,13 @@ namespace Wisp
     /// </summary>
     static class ForceUninstall
     {
-        static readonly Regex GuidRe = new Regex(@"^\{[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\}$", RegexOptions.IgnoreCase);
+        /// <summary>Where installers keep copies of uninstallers for many programs.</summary>
+        static readonly HashSet<string> installerCaches = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "Package Cache", "InstallShield Installation Information", "Installer", "Downloaded Installations", "Uninstall Information", "Temp",
+        };
+
+        static readonly Regex GuidRe =new Regex(@"^\{[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\}$", RegexOptions.IgnoreCase);
 
         /// <summary>keep: the programs that stay; nothing of theirs is offered.</summary>
         public static List<Leftover> Scan(InstalledApp app, Keep keep)
@@ -70,11 +79,13 @@ namespace Wisp
                 found.Add(l);
             };
 
-            add(new Leftover
-            {
-                Kind = LeftoverKind.RegKey, Hive = app.Hive, View = app.View, SubKey = app.KeyPath + "\\" + app.KeyName, Path = app.RegistryPath,
-                Reason = Leftover.R("Запись в списке программ", "Entry in the programs list"), Checked = true, IsEntry = true,
-            });
+            if (!app.Orphan)
+                add(new Leftover
+                {
+                    Kind = LeftoverKind.RegKey, Hive = app.Hive, View = app.View, SubKey = app.KeyPath + "\\" + app.KeyName, Path = app.RegistryPath,
+                    Reason = Leftover.R("Запись в списке программ", "Entry in the programs list"), Checked = true, IsEntry = true,
+                    Evidence = Evidence(app),
+                });
 
             var dirs = new List<string>();   // folders whose contents surely belong to the program
             foreach (var d in InstallDirs(app, keep))
@@ -93,7 +104,8 @@ namespace Wisp
                 if (l.Checked && !dirs.Any(d => FileOps.IsUnder(l.Path, d))) dirs.Add(FileOps.Norm(l.Path));
             }
 
-            if (app.IsMsi || GuidRe.IsMatch(app.KeyName)) Msi(app.KeyName, add);
+            string code = app.ProductCode ?? (GuidRe.IsMatch(app.KeyName) ? app.KeyName : null);
+            if (code != null && !app.Orphan) Msi(code, add);
             if (dirs.Count > 0)
             {
                 Services(dirs, add);
@@ -104,6 +116,45 @@ namespace Wisp
                 Shortcuts(dirs, add);
             }
             return found;
+        }
+
+        /// <summary>
+        /// The program's own files that say it is still installed: its folder (InstallLocation) and the
+        /// executables of its icon and uninstaller — not those kept in shared places (Windows, "Package Cache",
+        /// installer caches), which stay after a forced removal anyway.
+        /// </summary>
+        static List<string> Evidence(InstalledApp app)
+        {
+            var list = new List<string>();
+            string win = FileOps.Norm(Environment.GetFolderPath(Environment.SpecialFolder.Windows));
+            Func<string, bool> sharedPlace = p =>
+                FileOps.Norm(p).StartsWith(win, StringComparison.OrdinalIgnoreCase) || !FileOps.IsSafeRoot(p) ||
+                p.Split('\\').Any(part => installerCaches.Contains(part));
+            try
+            {
+                string loc = app.InstallLocation.Trim().Trim('"').TrimEnd('\\');
+                if (loc.Length > 3 && loc.IndexOf('%') < 0 && Directory.Exists(loc) && !sharedPlace(loc) && !Leftovers.IsShared(System.IO.Path.GetFileName(loc)))
+                    list.Add(loc);
+            }
+            catch { }
+            // The icon is the program itself; an uninstaller counts only inside Program Files (elsewhere it is mostly
+            // an installer's cached copy).
+            var programFiles = new[] { Environment.SpecialFolder.ProgramFiles, Environment.SpecialFolder.ProgramFilesX86 }
+                .Select(f => Environment.GetFolderPath(f)).Where(f => !string.IsNullOrEmpty(f)).ToList();
+            foreach (string cmd in new[] { app.Icon, app.UninstallString, app.QuietUninstallString })
+            {
+                try
+                {
+                    string exe = PathCheck.ExePath(cmd);
+                    if (string.IsNullOrEmpty(exe) || !File.Exists(exe) || sharedPlace(exe)) continue;
+                    if (!exe.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) continue;   // an .ico proves nothing
+                    if (cmd != app.Icon && !programFiles.Any(pf => FileOps.IsUnder(exe, pf))) continue;
+                    if (System.IO.Path.GetFileName(exe).Equals("msiexec.exe", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!list.Contains(exe, StringComparer.OrdinalIgnoreCase)) list.Add(exe);
+                }
+                catch { }
+            }
+            return list;
         }
 
         /// <summary>
@@ -193,7 +244,8 @@ namespace Wisp
                 keys.Add(Tuple.Create(u.Hive, u.Prefix + @"Software\Microsoft\Installer\Products\" + p));
                 keys.Add(Tuple.Create(u.Hive, u.Prefix + @"Software\Microsoft\Installer\Features\" + p));
             }
-            foreach (var k in keys) AddKeyIfExists(k.Item1, RegistryView.Registry64, k.Item2, reason, true, add);
+            // Removed together with the entry: a program whose files could not be removed stays registered.
+            foreach (var k in keys) AddKeyIfExists(k.Item1, RegistryView.Registry64, k.Item2, reason, true, add, true);
 
             // The upgrade code lists the product as a value.
             const string upgrade = @"SOFTWARE\Classes\Installer\UpgradeCodes";
@@ -204,7 +256,11 @@ namespace Wisp
                         foreach (string code in root.GetSubKeyNames())
                             using (var k = root.OpenSubKey(code))
                                 if (k != null && k.GetValue(p) != null)
-                                    add(Value(RegistryHive.LocalMachine, RegistryView.Registry64, upgrade + "\\" + code, p, reason, true));
+                                {
+                                    var v = Value(RegistryHive.LocalMachine, RegistryView.Registry64, upgrade + "\\" + code, p, reason, true);
+                                    v.WithEntry = true;
+                                    add(v);
+                                }
             }
             catch { }
         }
@@ -226,16 +282,17 @@ namespace Wisp
                             using (var k = services.OpenSubKey(name))
                             {
                                 if (k == null || !PathCheck.Mentions(Reg.Str(k, "ImagePath"), dirs)) continue;
-                                object type = k.GetValue("Type");
+                                object type = k.GetValue("Type"), launch = k.GetValue("LaunchProtected");
                                 bool driver = type is int && ((int)type & 0x3) != 0;
+                                bool prot = launch is int && (int)launch != 0;
                                 string display = Reg.Str(k, "DisplayName");
                                 add(new Leftover
                                 {
                                     Kind = LeftoverKind.Service, Name = name, Hive = RegistryHive.LocalMachine, View = RegistryView.Registry64, SubKey = root + "\\" + name,
                                     Path = name + (display.Length > 0 && !display.StartsWith("@") && display != name ? " (" + display + ")" : ""),
-                                    Reason = driver ? Leftover.R("Драйвер", "Driver") : Leftover.R("Служба", "Service"),
+                                    Reason = prot ? Leftover.R("Защищённая служба", "Protected service") : driver ? Leftover.R("Драйвер", "Driver") : Leftover.R("Служба", "Service"),
                                     // A driver may be shared with other software: listed, not ticked.
-                                    Checked = !driver,
+                                    Checked = !driver, Protected = prot,
                                 });
                             }
                         }
@@ -426,13 +483,17 @@ namespace Wisp
             }
         }
 
-        static void AddKeyIfExists(RegistryHive hive, RegistryView view, string sub, string reason, bool check, Action<Leftover> add)
+        static void AddKeyIfExists(RegistryHive hive, RegistryView view, string sub, string reason, bool check, Action<Leftover> add, bool withEntry = false)
         {
             try
             {
                 using (var k = Reg.Open(hive, view, sub))
                     if (k == null) return;
-                add(new Leftover { Kind = LeftoverKind.RegKey, Hive = hive, View = view, SubKey = sub, Path = Reg.Display(hive, view, sub), Reason = reason, Checked = check });
+                add(new Leftover
+                {
+                    Kind = LeftoverKind.RegKey, Hive = hive, View = view, SubKey = sub, Path = Reg.Display(hive, view, sub), Reason = reason, Checked = check,
+                    WithEntry = withEntry,
+                });
             }
             catch { }
         }
@@ -535,12 +596,17 @@ namespace Wisp
     {
         public int Done;
         public long Freed;
-        public int Reboot;               // folders that go away only after a restart (files were in use)
+        public int Reboot;               // things that go away only after a restart (files were in use)
         public string BackupDir;         // where the registry backups went (null if nothing was backed up)
         public readonly List<string> Errors = new List<string>();
+        public readonly List<string> Pending = new List<string>();   // files and folders queued for deletion at the next restart
     }
 
-    /// <summary>Removes leftovers in a safe order; every registry key and value is exported to a .reg file first.</summary>
+    /// <summary>
+    /// Removes leftovers in a safe order; every registry key and value is exported to a .reg file first.
+    /// The result is what is really gone: every item is looked up again afterwards, and whatever is still
+    /// there is reported with the reason.
+    /// </summary>
     static class LeftoverRemover
     {
         static readonly object backupLock = new object();
@@ -571,7 +637,38 @@ namespace Wisp
             return now != null && string.Equals(now, l.Final, StringComparison.OrdinalIgnoreCase);
         }
 
+        /// <summary>
+        /// What makes a forced removal impossible: services Windows starts as protected processes and protected
+        /// processes running from the programs' folders (antivirus self-defense). Neither can be stopped even by
+        /// an administrator, so nothing is touched when this is not empty. all: the whole list shown, so an
+        /// unticked protected service of a chosen program counts too.
+        /// </summary>
+        public static List<string> ProtectedParts(List<Leftover> all, List<Leftover> chosen)
+        {
+            var result = new List<string>();
+            var apps = new HashSet<string>(chosen.Select(c => c.App ?? ""), StringComparer.OrdinalIgnoreCase);
+            var mine = all.Where(i => apps.Contains(i.App ?? "")).ToList();
+            foreach (var s in mine.Where(i => i.Kind == LeftoverKind.Service && i.Protected))
+                result.Add(L.T("служба ", "service ") + s.Path);
+            var dirs = mine.Where(i => i.Kind == LeftoverKind.Folder).Select(f => FileOps.Norm(f.Path)).ToList();
+            foreach (var p in ProcessesUnder(dirs))
+            {
+                try { if (Secure.IsProtectedProcess(p.Id)) result.Add(L.T("процесс ", "process ") + p.ProcessName + ".exe"); }
+                catch { }
+                finally { p.Dispose(); }
+            }
+            return result.Distinct().ToList();
+        }
+
+        enum State { Gone, Pending, Present }
+
         public static RemoveResult Remove(List<Leftover> items)
+        {
+            // Keys of signed-out users: their registry is loaded for the removal and its check.
+            using (UserHives.Load(UserHives.SidsIn(items.Select(i => i.SubKey)).ToList())) return RemoveNow(items);
+        }
+
+        static RemoveResult RemoveNow(List<Leftover> items)
         {
             var r = new RemoveResult();
             string backup = NewBackupDir();
@@ -595,6 +692,10 @@ namespace Wisp
                 if (!Reg.Export(hive, view, sub, backupFile(id, ".reg")))
                     throw new IOException(L.T("не удалось сохранить резервную копию", "could not save a backup"));
             };
+            var why = new Dictionary<Leftover, string>();
+            Action<Leftover, string> fail = (l, reason) => { if (!why.ContainsKey(l)) why[l] = reason; };
+            var blocked = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);   // program → why it is left alone
+            Func<Leftover, bool> open = l => !blocked.ContainsKey(l.App ?? "");
 
             // 1. Services: stopped and deleted first, so their processes end and Windows does not restart them.
             foreach (var s in items.Where(i => i.Kind == LeftoverKind.Service))
@@ -605,119 +706,237 @@ namespace Wisp
                     Run("sc.exe", "stop \"" + s.Name + "\"", 15000);
                     WaitStopped(s.Name);
                     int code = Run("sc.exe", "delete \"" + s.Name + "\"", 15000);
-                    if (code == 0 || code == 1072 /* already marked for deletion */ || code == 1060 /* does not exist */) r.Done++;
-                    else r.Errors.Add(s.Path + ": sc " + code);
+                    if (code != 0 && code != 1072 /* already marked for deletion */ && code != 1060 /* does not exist */)
+                        fail(s, L.T("служба не удаляется: ", "the service cannot be deleted: ") + Win32Message(code));
                 }
-                catch (Exception ex) { r.Errors.Add(s.Path + ": " + ex.Message); }
+                catch (Exception ex) { fail(s, ex.Message); }
             }
 
-            // 2. Whatever still runs from the program's folders would keep its files locked
-            //    (the user saw the list and agreed, see RunningUnder).
+            // 2. Whatever still runs from the program's folders would keep its files locked (the user saw the
+            //    list and agreed, see RunningUnder). A program that keeps running — or whose service stays — is
+            //    left alone from here on: half of it removed would only break it.
             var folders = items.Where(i => i.Kind == LeftoverKind.Folder).ToList();
-            KillProcessesUnder(folders.Where(StillTheSame).Select(f => FileOps.Norm(f.Path)).ToList());
+            var survivors = KillProcessesUnder(folders.Where(StillTheSame).Select(f => FileOps.Norm(f.Path)).ToList());
+            foreach (var sv in survivors)
+            {
+                var owner = folders.FirstOrDefault(f => sv.Item1 != null && FileOps.IsUnder(sv.Item1, f.Path));
+                string app = owner != null ? owner.App ?? "" : "";
+                if (!blocked.ContainsKey(app)) blocked[app] = sv.Item2;
+            }
+            foreach (var s in items.Where(i => i.Kind == LeftoverKind.Service))
+                if (Check(s, r.Pending) == State.Present && !blocked.ContainsKey(s.App ?? ""))
+                    blocked[s.App ?? ""] = L.T("служба ", "service ") + s.Name + L.T(" осталась", " is still there") + (why.ContainsKey(s) ? " — " + why[s] : "");
 
             // 3. Scheduled tasks (their XML is kept in the backup folder: "schtasks /create /xml" brings one back).
-            foreach (var t in items.Where(i => i.Kind == LeftoverKind.Task))
+            foreach (var t in items.Where(i => i.Kind == LeftoverKind.Task).Where(open))
             {
                 try
                 {
                     string xml = TaskScheduler.Xml(t.Name);
                     if (xml != null) File.WriteAllText(backupFile(L.T("Задача ", "Task ") + t.Name, ".xml"), xml, System.Text.Encoding.Unicode);
                     int code = Run("schtasks.exe", "/delete /tn \"" + t.Name + "\" /f", 15000);
-                    if (code == 0) r.Done++;
-                    else r.Errors.Add(t.Path + ": schtasks " + code);
+                    if (code != 0) fail(t, "schtasks: " + code);
                 }
-                catch (Exception ex) { r.Errors.Add(t.Path + ": " + ex.Message); }
+                catch (Exception ex) { fail(t, ex.Message); }
             }
 
             // 4. Registry values, then keys (a key inside one already removed is done with it). The program's
-            //    own uninstall entry waits until its folders are gone (step 6).
-            foreach (var v in items.Where(i => i.Kind == LeftoverKind.RegValue))
+            //    own entry and its installer registration wait until the program is surely gone (step 6).
+            foreach (var v in items.Where(i => i.Kind == LeftoverKind.RegValue && !i.WithEntry).Where(open))
             {
                 try
                 {
                     export(v.Hive, v.View, v.SubKey);
                     using (var k = Reg.Open(v.Hive, v.View, v.SubKey, true))
                         if (k != null) k.DeleteValue(v.ValueName, false);
-                    r.Done++;
                 }
-                catch (Exception ex) { r.Errors.Add(v.Path + ": " + ex.Message); }
+                catch (Exception ex) { fail(v, ex.Message); }
             }
             var gone = new List<string>();
             Action<Leftover> removeKey = k =>
             {
                 string id = Reg.Display(k.Hive, k.View, k.SubKey);
-                if (gone.Any(g => id.StartsWith(g + "\\", StringComparison.OrdinalIgnoreCase))) { r.Done++; return; }
+                if (gone.Any(g => id.StartsWith(g + "\\", StringComparison.OrdinalIgnoreCase))) return;
                 try
                 {
                     using (var test = Reg.Open(k.Hive, k.View, k.SubKey))
-                        if (test == null) { r.Done++; return; }
+                        if (test == null) return;
                     export(k.Hive, k.View, k.SubKey);
                     using (var b = RegistryKey.OpenBaseKey(k.Hive, k.View)) b.DeleteSubKeyTree(k.SubKey, false);
                     gone.Add(id);
-                    r.Done++;
                 }
-                catch (Exception ex) { r.Errors.Add(k.Path + ": " + ex.Message); }
+                catch (Exception ex) { fail(k, ex.Message); }
             };
-            foreach (var k in items.Where(i => i.Kind == LeftoverKind.RegKey && !i.IsEntry).OrderBy(i => i.SubKey.Length)) removeKey(k);
+            foreach (var k in items.Where(i => i.Kind == LeftoverKind.RegKey && !i.IsEntry && !i.WithEntry).Where(open).OrderBy(i => i.SubKey.Length)) removeKey(k);
 
-            // 5. Shortcuts, then the folders: to the Recycle Bin; files in use are deleted at the next restart.
-            foreach (var f in items.Where(i => i.Kind == LeftoverKind.File))
+            // 5. Shortcuts, then the folders: to the Recycle Bin; what remains is deleted directly, and a file
+            //    another program holds open is deleted at the next restart.
+            foreach (var f in items.Where(i => i.Kind == LeftoverKind.File).Where(open))
             {
                 try
                 {
-                    if (!StillTheSame(f)) { r.Errors.Add(f.Path + ": " + L.T("путь изменился", "the path changed")); continue; }
+                    if (!StillTheSame(f)) { fail(f, L.T("путь изменился", "the path changed")); continue; }
                     if (File.Exists(f.Path)) Native.MoveToRecycleBin(new[] { f.Path });
                     if (File.Exists(f.Path)) File.Delete(f.Path);
-                    r.Done++;
-                    r.Freed += f.Size;
                     RemoveEmptyStartMenuFolders(Path.GetDirectoryName(f.Path));
                 }
-                catch (Exception ex) { r.Errors.Add(f.Path + ": " + ex.Message); }
+                catch (Exception ex) { fail(f, ex.Message); }
             }
-            bool foldersFailed = false;
-            foreach (var d in folders.OrderByDescending(f => f.Path.Length))
+            var pendingFolders = new HashSet<Leftover>();
+            foreach (var d in folders.Where(open).OrderByDescending(f => f.Path.Length))
             {
-                if (!Directory.Exists(d.Path)) { r.Done++; r.Freed += d.Size; continue; }
-                if (!FileOps.IsSafeRoot(d.Path) || !StillTheSame(d))
-                {
-                    r.Errors.Add(d.Path + ": " + L.T("путь изменился", "the path changed"));
-                    foldersFailed = true;
-                    continue;
-                }
+                if (!Directory.Exists(d.Path)) continue;
+                if (!FileOps.IsSafeRoot(d.Path) || !StillTheSame(d)) { fail(d, L.T("путь изменился", "the path changed")); continue; }
                 Native.MoveToRecycleBin(new[] { d.Path });
-                bool reboot = Directory.Exists(d.Path) && StillTheSame(d) && HardDelete(d.Path);
-                if (!Directory.Exists(d.Path)) { r.Done++; r.Freed += d.Size; }
-                else if (reboot) { r.Done++; r.Reboot++; }
-                else { r.Errors.Add(d.Path); foldersFailed = true; }
+                if (!Directory.Exists(d.Path) || !StillTheSame(d)) continue;
+                bool pending;
+                string error = HardDelete(d.Path, r.Pending, out pending);
+                if (error != null) fail(d, error);
+                else if (pending) pendingFolders.Add(d);
             }
 
-            // 6. The program's entry: only when its folders went, so a failed removal can be tried again.
-            foreach (var k in items.Where(i => i.Kind == LeftoverKind.RegKey && i.IsEntry))
+            // 6. The program's entry (and its installer registration): only when the program is surely gone —
+            //    nothing of it runs, its folders and services went, and its own files are no longer there.
+            //    Otherwise it stays in the list, and the removal can be finished later.
+            var skipped = new HashSet<Leftover>();
+            foreach (var e in items.Where(i => i.Kind == LeftoverKind.RegKey && i.IsEntry))
             {
-                if (foldersFailed) r.Errors.Add(k.Path + ": " + L.T("запись оставлена — папку не удалось удалить", "entry kept — a folder could not be removed"));
-                else removeKey(k);
+                string app = e.App ?? "";
+                var together = items.Where(i => i.WithEntry && string.Equals(i.App ?? "", app, StringComparison.OrdinalIgnoreCase)).ToList();
+                string keep = null;
+                if (blocked.ContainsKey(app)) keep = blocked[app];
+                else
+                {
+                    var left = items.FirstOrDefault(i => string.Equals(i.App ?? "", app, StringComparison.OrdinalIgnoreCase) &&
+                                                         (i.Kind == LeftoverKind.Folder || i.Kind == LeftoverKind.Service) &&
+                                                         Check(i, r.Pending, pendingFolders) == State.Present);
+                    if (left != null) keep = L.T("не удалось удалить ", "could not remove ") + left.Path;
+                    else
+                    {
+                        string file = (e.Evidence ?? new List<string>()).FirstOrDefault(p => (File.Exists(p) || Directory.Exists(p)) && !IsPending(p, r.Pending));
+                        if (file != null) keep = L.T("на месте файлы программы: ", "the program's files are still there: ") + file;
+                    }
+                }
+                if (keep != null)
+                {
+                    fail(e, L.T("запись оставлена в списке — ", "entry kept in the list — ") + keep);
+                    foreach (var w in together) skipped.Add(w);
+                    continue;
+                }
+                foreach (var w in together.Where(i => i.Kind == LeftoverKind.RegValue))
+                {
+                    try
+                    {
+                        export(w.Hive, w.View, w.SubKey);
+                        using (var k = Reg.Open(w.Hive, w.View, w.SubKey, true))
+                            if (k != null) k.DeleteValue(w.ValueName, false);
+                    }
+                    catch (Exception ex) { fail(w, ex.Message); }
+                }
+                foreach (var w in together.Where(i => i.Kind == LeftoverKind.RegKey).OrderBy(i => i.SubKey.Length)) removeKey(w);
+                removeKey(e);
             }
+
+            // 7. The result: every item is looked up again.
+            foreach (var b in blocked)
+                r.Errors.Add((b.Key.Length > 0 ? b.Key + ": " : "") + L.T("удаление остановлено — ", "removal stopped — ") + b.Value);
+            foreach (var i in items)
+            {
+                if (skipped.Contains(i)) continue;
+                var state = Check(i, r.Pending, pendingFolders);
+                // A stopped program's items were left alone on purpose (one line above says why); only what went counts.
+                if (!open(i) && state == State.Present) continue;
+                switch (state)
+                {
+                    case State.Gone:
+                        r.Done++;
+                        if (i.Kind == LeftoverKind.Folder || i.Kind == LeftoverKind.File) r.Freed += i.Size;
+                        break;
+                    case State.Pending:
+                        r.Done++;
+                        r.Reboot++;
+                        break;
+                    default:
+                        r.Errors.Add(i.Path + ": " + (why.ContainsKey(i) ? why[i] : L.T("осталось на месте", "is still there")));
+                        break;
+                }
+            }
+            if (r.Pending.Count > 0) PendingCheck.Remember(r.Pending);
             return r;
         }
 
-        /// <summary>
-        /// Deletes what the Recycle Bin left. A file still in use (and only that) is deleted at the next restart;
-        /// returns true if something waits for it.
-        /// </summary>
-        static bool HardDelete(string dir)
+        static bool IsPending(string path, List<string> pending)
         {
+            return pending.Any(p => FileOps.SamePath(p, path) || FileOps.IsUnder(path, p));
+        }
+
+        static State Check(Leftover l, List<string> pending, HashSet<Leftover> pendingFolders = null)
+        {
+            try
+            {
+                switch (l.Kind)
+                {
+                    case LeftoverKind.RegKey:
+                        using (var k = Reg.Open(l.Hive, l.View, l.SubKey)) return k == null ? State.Gone : State.Present;
+                    case LeftoverKind.RegValue:
+                        using (var k = Reg.Open(l.Hive, l.View, l.SubKey)) return k == null || k.GetValue(l.ValueName) == null ? State.Gone : State.Present;
+                    case LeftoverKind.Service:
+                        using (var k = Reg.Open(l.Hive, l.View, l.SubKey))
+                        {
+                            if (k == null) return State.Gone;
+                            object flag = k.GetValue("DeleteFlag");   // marked for deletion: goes at the restart
+                            return flag is int && (int)flag != 0 ? State.Pending : State.Present;
+                        }
+                    case LeftoverKind.Task:
+                        return TaskScheduler.Xml(l.Name) == null ? State.Gone : State.Present;
+                    case LeftoverKind.File:
+                        if (!File.Exists(l.Path)) return State.Gone;
+                        return IsPending(l.Path, pending) ? State.Pending : State.Present;
+                    case LeftoverKind.Folder:
+                        if (!Directory.Exists(l.Path)) return State.Gone;
+                        return pendingFolders != null && pendingFolders.Contains(l) ? State.Pending : State.Present;
+                }
+            }
+            catch { }
+            return State.Present;
+        }
+
+        static string Win32Message(int code)
+        {
+            return new System.ComponentModel.Win32Exception(code).Message + " (" + code + ")";
+        }
+
+        /// <summary>
+        /// Deletes what the Recycle Bin left. A file another program holds open or has loaded (Restart Manager
+        /// names it) is deleted at the next restart and pending is set; anything else that refuses — a file a
+        /// protection driver guards, say — is an error: the first one is returned (null when all went).
+        /// </summary>
+        static string HardDelete(string dir, List<string> pendingList, out bool pending)
+        {
+            pending = false;
             string parent = Path.GetDirectoryName(dir.TrimEnd('\\'));
             string parentFinal = parent != null ? Secure.FinalPath(parent) : null;
             string dirFinal = Secure.FinalPath(dir);
-            if (parentFinal == null || dirFinal == null) return false;
-            bool pending = false;
+            if (parentFinal == null || dirFinal == null) return L.T("папку не открыть", "the folder cannot be opened");
+            string error = null;
+            var queued = new List<string>();
             var files = new List<FileEntry>();
             FileOps.Collect(dir, null, true, 0, files);
             foreach (var f in files)
             {
                 bool inUse;
-                if (!Secure.Delete(f.Path, dirFinal, out inUse) && inUse && Secure.DeleteOnReboot(f.Path)) pending = true;
+                if (Secure.Delete(f.Path, dirFinal, out inUse) || !File.Exists(f.Path)) continue;
+                var by = inUse ? Secure.LockedBy(f.Path) : new List<string>();
+                if (by.Count > 0 && Secure.DeleteOnReboot(f.Path))
+                {
+                    pending = true;
+                    queued.Add(f.Path);
+                    continue;
+                }
+                if (error == null)
+                    error = Path.GetFileName(f.Path) + ": " + (by.Count > 0
+                        ? L.T("занят (", "in use (") + string.Join(", ", by) + ")"
+                        : L.T("доступ запрещён — файл защищён", "access denied — the file is protected"));
             }
             FileOps.RemoveEmptyDirs(dir, 0);
             var rest = new List<string>();
@@ -738,12 +957,16 @@ namespace Wisp
             {
                 try
                 {
-                    // Folders follow their files: queued for the restart only after something inside was.
-                    if (Directory.Exists(d) && !Secure.Delete(d, d == dir ? parentFinal : dirFinal) && pending) Secure.DeleteOnReboot(d);
+                    // Folders follow their files: queued for the restart only when everything inside was.
+                    if (Directory.Exists(d) && !Secure.Delete(d, d == dir ? parentFinal : dirFinal) && pending && error == null && Secure.DeleteOnReboot(d))
+                        queued.Add(d);
                 }
                 catch { }
             }
-            return pending;
+            if (error != null) pending = false;
+            pendingList.AddRange(queued);
+            if (Directory.Exists(dir) && !pending && error == null) error = L.T("папка не удалилась", "the folder was not removed");
+            return error;
         }
 
         /// <summary>A Start menu folder left empty by removing a shortcut goes too (never the Programs folder itself).</summary>
@@ -806,21 +1029,48 @@ namespace Wisp
             return result.Distinct().ToList();
         }
 
-        static void KillProcessesUnder(List<string> dirs)
+        /// <summary>
+        /// Ends what runs from the folders, in a few rounds (a watchdog may start a process again), and returns
+        /// what is still running afterwards: its image path and why it did not close.
+        /// </summary>
+        static List<Tuple<string, string>> KillProcessesUnder(List<string> dirs)
         {
+            var left = new List<Tuple<string, string>>();
+            if (dirs.Count == 0) return left;
+            var denied = new HashSet<int>();
+            for (int round = 0; round < 3; round++)
+            {
+                var list = ProcessesUnder(dirs);
+                if (list.Count == 0) return left;
+                foreach (var p in list)
+                {
+                    try
+                    {
+                        p.Kill();
+                        p.WaitForExit(5000);
+                    }
+                    catch { denied.Add(p.Id); }
+                    finally { p.Dispose(); }
+                }
+                System.Threading.Thread.Sleep(700);
+            }
             foreach (var p in ProcessesUnder(dirs))
             {
                 try
                 {
-                    p.Kill();
-                    p.WaitForExit(5000);
+                    string reason = Secure.IsProtectedProcess(p.Id)
+                        ? L.T("защищённый процесс, Windows не даёт его завершить", "a protected process, Windows does not let it be ended")
+                        : denied.Contains(p.Id) ? L.T("нет доступа", "access denied") : L.T("запускается снова", "it starts again");
+                    left.Add(Tuple.Create(Secure.ImagePath(p.Id), p.ProcessName + ".exe " + L.T("не закрывается: ", "does not close: ") + reason));
                 }
                 catch { }
                 finally { p.Dispose(); }
             }
+            return left;
         }
 
-        static void WaitStopped(string service)
+        /// <summary>Waits up to 10 s for the service to stop; true when it is stopped or gone.</summary>
+        static bool WaitStopped(string service)
         {
             var sw = Stopwatch.StartNew();
             while (sw.ElapsedMilliseconds < 10000)
@@ -828,9 +1078,10 @@ namespace Wisp
                 string output;
                 Run("sc.exe", "query \"" + service + "\"", 5000, out output);
                 var m = Regex.Match(output ?? "", @"STATE\s*:\s*(\d+)");
-                if (!m.Success || m.Groups[1].Value == "1") return;   // 1 = STOPPED
+                if (!m.Success || m.Groups[1].Value == "1") return true;   // 1 = STOPPED
                 System.Threading.Thread.Sleep(300);
             }
+            return false;
         }
 
         static int Run(string exe, string args, int timeout)
@@ -856,6 +1107,57 @@ namespace Wisp
                 lock (sb) output = sb.ToString();
                 return exited ? p.ExitCode : -1;
             }
+        }
+    }
+
+    /// <summary>
+    /// Files queued for deletion at the restart are checked at the next start: what is still there after a
+    /// restart is reported, so "deleted after a restart" is never taken on trust.
+    /// </summary>
+    static class PendingCheck
+    {
+        static string FilePath { get { return Path.Combine(Settings.BackupDir, "pending.txt"); } }
+
+        [DllImport("kernel32.dll")]
+        static extern ulong GetTickCount64();
+
+        static DateTime BootTime { get { return DateTime.Now - TimeSpan.FromMilliseconds(GetTickCount64()); } }
+
+        public static void Remember(IEnumerable<string> paths)
+        {
+            try
+            {
+                Directory.CreateDirectory(Settings.BackupDir);
+                string boot = BootTime.ToString("o");
+                File.AppendAllLines(FilePath, paths.Select(p => boot + "\t" + p), System.Text.Encoding.UTF8);
+            }
+            catch { }
+        }
+
+        /// <summary>After a restart: the queued paths that are still there (the list is then forgotten). Empty before a restart.</summary>
+        public static List<string> StillThere()
+        {
+            var left = new List<string>();
+            try
+            {
+                if (!File.Exists(FilePath)) return left;
+                var keep = new List<string>();
+                DateTime boot = BootTime;
+                foreach (string line in File.ReadAllLines(FilePath, System.Text.Encoding.UTF8))
+                {
+                    int tab = line.IndexOf('\t');
+                    DateTime then;
+                    if (tab < 0 || !DateTime.TryParse(line.Substring(0, tab), null, System.Globalization.DateTimeStyles.RoundtripKind, out then)) continue;
+                    // The same boot (give or take the clock's drift): not restarted yet.
+                    if (Math.Abs((then - boot).TotalMinutes) < 2) { keep.Add(line); continue; }
+                    string path = line.Substring(tab + 1);
+                    if (File.Exists(path) || Directory.Exists(path)) left.Add(path);
+                }
+                if (keep.Count > 0) File.WriteAllLines(FilePath, keep, System.Text.Encoding.UTF8);
+                else File.Delete(FilePath);
+            }
+            catch { }
+            return left;
         }
     }
 }
